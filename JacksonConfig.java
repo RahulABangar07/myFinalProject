@@ -1,7 +1,8 @@
-package com.example.filters.config;
+package com.example.filterdemo.config;
 
-import com.example.filters.json.FilterDeserializer;
-import com.example.filters.model.Filter;
+import com.example.filterdemo.json.FilterDeserializer;
+import com.example.filterdemo.model.CompositeFilter;
+import com.example.filterdemo.model.Filter;
 import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import org.springframework.context.annotation.Bean;
@@ -13,7 +14,9 @@ public class JacksonConfig {
     @Bean
     public Module filterDeserializerModule() {
         SimpleModule module = new SimpleModule();
-        module.addDeserializer(Filter.class, new FilterDeserializer());
+        FilterDeserializer deserializer = new FilterDeserializer();
+        module.addDeserializer(Filter.class, deserializer);
+        module.addDeserializer(CompositeFilter.class, deserializer);
         return module;
     }
 }
