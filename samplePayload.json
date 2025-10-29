@@ -1,0 +1,38 @@
+{
+  "id": "101",
+  "number": "N01",
+  "name": "CustomerAgeFilter",
+  "description": "Filter for customer by city and age",
+  "creationDate": "2025-10-30",
+  "compositeFilter": {
+    "logical": "AND",
+    "filters": [
+      {
+        "fieldName": "age",
+        "fieldDisplayName": "Age",
+        "operator": "GREATER_THAN",
+        "value": 30,
+        "isArrayField": false
+      },
+      {
+        "logical": "OR",
+        "filters": [
+          {
+            "fieldName": "city",
+            "fieldDisplayName": "City",
+            "operator": "EQUALS",
+            "value": "Pune",
+            "isArrayField": false
+          },
+          {
+            "fieldName": "city",
+            "fieldDisplayName": "City",
+            "operator": "EQUALS",
+            "value": "Mumbai",
+            "isArrayField": false
+          }
+        ]
+      }
+    ]
+  }
+}
