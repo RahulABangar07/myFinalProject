@@ -1,0 +1,23 @@
+Find any element in array
+
+public Mono<List<Map<String, Object>>> findAny(
+        SearchAsyncClient client,
+        String arrayField,
+        List<String> values) {
+
+    String expr = values.stream()
+            .map(v -> String.format("x eq '%s'", v))
+            .collect(Collectors.joining(" or "));
+
+    String filter = String.format("%s/any(x: %s)", arrayField, expr);
+
+    SearchOptions options = new SearchOptions()
+            .setFilter(filter)
+            .setSelect("id", arrayField);
+
+    return client.search("*", options)
+            .flatMapMany(SearchPagedFlux::byPage)
+            .flatMap(page -> Flux.fromIterable(page.getValue()))
+            .map(sr -> sr.getDocument())
+            .collectList();
+}
