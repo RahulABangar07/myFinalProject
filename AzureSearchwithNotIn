@@ -1,0 +1,81 @@
+import java.util.*;
+import java.util.stream.Collectors;
+
+public final class AzureSearchFilterBuilder {
+
+    private AzureSearchFilterBuilder() {}
+
+    /**
+     * Builds a NOT EQUAL / NOT IN filter for Azure Cognitive Search.
+     *
+     * @param fieldName     Index field name
+     * @param values        Single value or collection
+     * @param isCollection  True if index field is a collection
+     * @return OData filter string
+     */
+    public static String buildNotInFilter(
+            String fieldName,
+            Object values,
+            boolean isCollection
+    ) {
+        List<String> valueList = normalize(values);
+
+        if (valueList.isEmpty()) {
+            return "";
+        }
+
+        if (isCollection) {
+            return buildCollectionNotIn(fieldName, valueList);
+        }
+
+        return buildScalarNotIn(fieldName, valueList);
+    }
+
+    /* ---------------- Internal helpers ---------------- */
+
+    private static String buildScalarNotIn(String field, List<String> values) {
+        return values.stream()
+                .map(v -> field + " ne " + quote(v))
+                .collect(Collectors.joining(" and "));
+    }
+
+    private static String buildCollectionNotIn(String field, List<String> values) {
+        String inner = values.stream()
+                .map(v -> "x eq " + quote(v))
+                .collect(Collectors.joining(" or "));
+
+        return "not " + field + "/any(x: " + inner + ")";
+    }
+
+    private static List<String> normalize(Object values) {
+        if (values == null) {
+            return Collections.emptyList();
+        }
+
+        if (values instanceof String) {
+            return List.of((String) values);
+        }
+
+        if (values instanceof Collection<?>) {
+            return ((Collection<?>) values).stream()
+                    .filter(Objects::nonNull)
+                    .map(Object::toString)
+                    .collect(Collectors.toList());
+        }
+
+        throw new IllegalArgumentException(
+                "Values must be String or Collection<String>");
+    }
+
+    private static String quote(String value) {
+        return "'" + escapeOData(value) + "'";
+    }
+
+    /**
+     * Escapes OData string literals.
+     * Single quotes are escaped by doubling them.
+     */
+    private static String escapeOData(String value) {
+        return value.replace("'", "''");
+    }
+}
