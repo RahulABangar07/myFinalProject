@@ -1,0 +1,71 @@
+@Service
+public class MarketWiseClientCountService {
+
+    private final SearchClient searchClient;
+
+    public MarketWiseClientCountService(SearchClient searchClient) {
+        this.searchClient = searchClient;
+    }
+
+    /**
+     * Step 1: Fetch all distinct markets
+     */
+    private Mono<List<String>> fetchMarkets() {
+        return Mono.fromCallable(() -> {
+
+            SearchOptions options = new SearchOptions()
+                .setTop(0)
+                .setFacets(List.of("market,count:10000"));
+
+            SearchPagedIterable results =
+                searchClient.search("*", options, Context.NONE);
+
+            List<FacetResult> facets =
+                results.getFacets().get("market");
+
+            if (facets == null) return List.of();
+
+            return facets.stream()
+                .map(FacetResult::getValue)
+                .map(Object::toString)
+                .toList();
+
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * Step 2: Unique client count per market
+     */
+    private Mono<MarketClientCount> countClientsForMarket(String market) {
+        return Mono.fromCallable(() -> {
+
+            SearchOptions options = new SearchOptions()
+                .setTop(0)
+                .setFilter("market eq '" + market + "'")
+                .setFacets(List.of("clientId,count:1000000"));
+
+            SearchPagedIterable results =
+                searchClient.search("*", options, Context.NONE);
+
+            List<FacetResult> facets =
+                results.getFacets().get("clientId");
+
+            long count = (facets == null) ? 0 : facets.size();
+
+            return new MarketClientCount(market, count);
+
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * Step 3: Parallel execution
+     */
+    public Flux<MarketClientCount> fetchMarketWiseCounts() {
+        return fetchMarkets()
+            .flatMapMany(Flux::fromIterable)
+            .flatMap(
+                this::countClientsForMarket,
+                10 // 🔥 parallelism (tune based on replicas)
+            );
+    }
+}
