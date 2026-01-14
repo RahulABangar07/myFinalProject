@@ -1,0 +1,60 @@
+import com.azure.search.documents.models.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class ClientFilterGrouping {
+
+    public static Mono<Map<String, List<String>>> execute(
+            SearchAsyncClient client,
+            List<FilterQuery> filterQueries
+    ) {
+
+        return Flux.fromIterable(filterQueries)
+
+            // Run all filter queries concurrently
+            .flatMap(filterQuery -> {
+
+                SearchOptions options = new SearchOptions()
+                    .setFilter(filterQuery.filter())
+                    .setSelect("clientId")
+                    .setTop(1000); // adjust as needed
+
+                return client.search("*", options)
+                    .flatMapMany(SearchPagedFlux::getSearchResults)
+
+                    // Extract clientId
+                    .map(result -> result.getDocument().get("clientId"))
+                    .filter(Objects::nonNull)
+
+                    // Create (clientId, filterQueryName) pairs
+                    .map(clientId ->
+                        Map.entry(clientId.toString(), filterQuery.name())
+                    );
+
+            }, filterQueries.size()) // max concurrency = number of queries
+
+            // Group by clientId
+            .groupBy(Map.Entry::getKey)
+
+            // Collect filterQueryNames per clientId
+            .flatMap(groupedFlux ->
+                groupedFlux
+                    .map(Map.Entry::getValue)
+                    .distinct()
+                    .collectList()
+                    .map(list ->
+                        Map.entry(groupedFlux.key(), list)
+                    )
+            )
+
+            // Convert to Map<clientId, List<filterQueryName>>
+            .collectMap(Map.Entry::getKey, Map.Entry::getValue)
+
+            // Enforce SLA
+            .timeout(Duration.ofSeconds(3));
+    }
+}
