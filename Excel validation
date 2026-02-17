@@ -1,0 +1,86 @@
+@Service
+public class ExcelValidationService {
+
+    private static final String REQUIRED_SHEET1 = "Sheet1";
+    private static final String REQUIRED_SHEET2 = "Sheet2";
+
+    private static final List<String> REQUIRED_COLUMNS_SHEET1 =
+            List.of("Id", "Name", "Email");
+
+    private static final List<String> REQUIRED_COLUMNS_SHEET2 =
+            List.of("OrderId", "Product", "Amount");
+
+    public Mono<Boolean> validate(FilePart filePart) {
+
+        return DataBufferUtils.join(filePart.content())
+                .publishOn(Schedulers.boundedElastic())
+                .map(dataBuffer -> {
+
+                    try (InputStream is = dataBuffer.asInputStream();
+                         Workbook workbook = WorkbookFactory.create(is)) {
+
+                        validateSheet(workbook, REQUIRED_SHEET1, REQUIRED_COLUMNS_SHEET1);
+                        validateSheet(workbook, REQUIRED_SHEET2, REQUIRED_COLUMNS_SHEET2);
+
+                        return true;
+
+                    } catch (Exception e) {
+                        throw new RuntimeException("Excel validation failed: " + e.getMessage());
+                    }
+                });
+    }
+
+    private void validateSheet(Workbook workbook,
+                               String requiredSheetName,
+                               List<String> requiredColumns) {
+
+        Sheet sheet = workbook.getSheet(requiredSheetName);
+
+        if (sheet == null) {
+            throw new RuntimeException("Missing required sheet: " + requiredSheetName);
+        }
+
+        Row headerRow = sheet.getRow(0);
+
+        if (headerRow == null) {
+            throw new RuntimeException("Header row missing in sheet: " + requiredSheetName);
+        }
+
+        List<String> actualColumns = new ArrayList<>();
+
+        for (Cell cell : headerRow) {
+            actualColumns.add(cell.getStringCellValue().trim());
+        }
+
+        if (!actualColumns.equals(requiredColumns)) {
+            throw new RuntimeException(
+                    "Column mismatch in sheet: " + requiredSheetName +
+                            ". Expected: " + requiredColumns +
+                            ", Found: " + actualColumns
+            );
+        }
+    }
+}
+
+
+@RestController
+@RequestMapping("/api/excel")
+public class ExcelValidationController {
+
+    private final ExcelValidationService validationService;
+
+    public ExcelValidationController(ExcelValidationService validationService) {
+        this.validationService = validationService;
+    }
+
+    @PostMapping(value = "/validate", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public Mono<ResponseEntity<String>> validateExcel(@RequestPart("file") FilePart filePart) {
+
+        return validationService.validate(filePart)
+                .map(valid -> ResponseEntity.ok("Excel file is valid"))
+                .onErrorResume(ex ->
+                        Mono.just(ResponseEntity.badRequest().body(ex.getMessage()))
+                );
+    }
+}
+
