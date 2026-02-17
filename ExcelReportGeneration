@@ -1,0 +1,134 @@
+<!-- WebFlux -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+</dependency>
+
+<!-- Azure Cosmos Reactive -->
+<dependency>
+    <groupId>com.azure.spring</groupId>
+    <artifactId>azure-spring-data-cosmos</artifactId>
+</dependency>
+
+<!-- Apache POI -->
+<dependency>
+    <groupId>org.apache.poi</groupId>
+    <artifactId>poi-ooxml</artifactId>
+    <version>5.2.5</version>
+</dependency>
+
+
+@Repository
+public interface OrderRepository extends ReactiveCosmosRepository<OrderEntity, String> {
+
+    @Query("SELECT * FROM c WHERE c.date >= @fromDate AND c.date <= @toDate")
+    Flux<OrderEntity> findByDateRange(String fromDate, String toDate);
+
+    @Query("SELECT * FROM c WHERE c.date >= @fromDate AND c.date <= @toDate AND c.type = @type")
+    Flux<OrderEntity> findByDateRangeAndType(String fromDate, String toDate, String type);
+}
+
+
+@Service
+public class ReportService {
+
+    private final OrderRepository orderRepository;
+
+    public ReportService(OrderRepository orderRepository) {
+        this.orderRepository = orderRepository;
+    }
+
+    public Mono<byte[]> generateReport(String fromDate, String toDate, String type) {
+
+        Flux<OrderEntity> query1 =
+                type == null
+                        ? orderRepository.findByDateRange(fromDate, toDate)
+                        : orderRepository.findByDateRangeAndType(fromDate, toDate, type);
+
+        Flux<OrderEntity> query2 =
+                orderRepository.findByDateRange(fromDate, toDate); // Example second query
+
+        return Mono.zip(
+                        query1.collectList(),
+                        query2.collectList()
+                )
+                .publishOn(Schedulers.boundedElastic()) // POI is blocking
+                .map(tuple -> {
+
+                    List<OrderEntity> list1 = tuple.getT1();
+                    List<OrderEntity> list2 = tuple.getT2();
+
+                    try (Workbook workbook = new XSSFWorkbook();
+                         ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+                        createSheet(workbook, "Orders_Summary", list1);
+                        createSheet(workbook, "Orders_Details", list2);
+
+                        workbook.write(out);
+                        return out.toByteArray();
+
+                    } catch (Exception e) {
+                        throw new RuntimeException("Error generating Excel: " + e.getMessage());
+                    }
+                });
+    }
+
+    private void createSheet(Workbook workbook,
+                             String sheetName,
+                             List<OrderEntity> data) {
+
+        Sheet sheet = workbook.createSheet(sheetName);
+
+        Row header = sheet.createRow(0);
+        header.createCell(0).setCellValue("Id");
+        header.createCell(1).setCellValue("Date");
+        header.createCell(2).setCellValue("Type");
+        header.createCell(3).setCellValue("Amount");
+
+        int rowIdx = 1;
+
+        for (OrderEntity entity : data) {
+            Row row = sheet.createRow(rowIdx++);
+            row.createCell(0).setCellValue(entity.getId());
+            row.createCell(1).setCellValue(entity.getDate());
+            row.createCell(2).setCellValue(entity.getType());
+            row.createCell(3).setCellValue(entity.getAmount());
+        }
+    }
+}
+
+
+@RestController
+@RequestMapping("/v2")
+public class ReportController {
+
+    private final ReportService reportService;
+
+    public ReportController(ReportService reportService) {
+        this.reportService = reportService;
+    }
+
+    @GetMapping("/download")
+    public Mono<ResponseEntity<byte[]>> downloadReport(
+            @RequestHeader("Authorization") String token,
+            @RequestParam String fromDate,
+            @RequestParam String toDate,
+            @RequestParam(required = false) String type) {
+
+        if (fromDate == null || toDate == null) {
+            return Mono.just(ResponseEntity.badRequest().build());
+        }
+
+        // You can validate token here
+
+        return reportService.generateReport(fromDate, toDate, type)
+                .map(bytes ->
+                        ResponseEntity.ok()
+                                .header(HttpHeaders.CONTENT_DISPOSITION,
+                                        "attachment; filename=report.xlsx")
+                                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                                .body(bytes)
+                );
+    }
+}
+
