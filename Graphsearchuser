@@ -1,0 +1,70 @@
+import com.azure.identity.ClientSecretCredential;
+import com.azure.identity.ClientSecretCredentialBuilder;
+import com.microsoft.graph.models.User;
+import com.microsoft.graph.models.UserCollectionResponse;
+import com.microsoft.graph.serviceclient.GraphServiceClient;
+
+import java.util.List;
+
+public class GraphUserSearch {
+
+    // ====== REPLACE WITH YOUR VALUES ======
+    private static final String CLIENT_ID = "YOUR_CLIENT_ID";
+    private static final String CLIENT_SECRET = "YOUR_CLIENT_SECRET";
+    private static final String TENANT_ID = "YOUR_TENANT_ID";
+    // ======================================
+
+    public static void main(String[] args) {
+
+        // 1️⃣ Create credential
+        ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+                .clientId(CLIENT_ID)
+                .clientSecret(CLIENT_SECRET)
+                .tenantId(TENANT_ID)
+                .build();
+
+        // 2️⃣ Create Graph client
+        GraphServiceClient graphClient = new GraphServiceClient(credential);
+
+        // 3️⃣ Search string
+        String searchText = "john";
+
+        try {
+            UserCollectionResponse response = graphClient
+                    .users()
+                    .get(requestConfig -> {
+                        requestConfig.queryParameters.search = "\"" + searchText + "\"";
+                        requestConfig.queryParameters.select = new String[]{"id", "displayName", "mail", "userPrincipalName"};
+                        requestConfig.headers.add("ConsistencyLevel", "eventual");
+                    });
+
+            List<User> users = response.getValue();
+
+            // 4️⃣ Print results
+            if (users != null) {
+                for (User user : users) {
+                    System.out.println("ID: " + user.getId());
+                    System.out.println("Name: " + user.getDisplayName());
+                    System.out.println("Email: " + user.getMail());
+                    System.out.println("UPN: " + user.getUserPrincipalName());
+                    System.out.println("---------------------------");
+                }
+            }
+
+            // 5️⃣ Handle paging (if more results exist)
+            while (response.getOdataNextLink() != null) {
+                response = graphClient.users()
+                        .withUrl(response.getOdataNextLink())
+                        .get();
+
+                for (User user : response.getValue()) {
+                    System.out.println("ID: " + user.getId());
+                    System.out.println("Name: " + user.getDisplayName());
+                }
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
