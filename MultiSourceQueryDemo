@@ -1,0 +1,348 @@
+import java.lang.annotation.*;
+import java.lang.reflect.Field;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Single-file implementation:
+ * - Model -> SQL / Azure Search field mapping
+ * - Cached reflection
+ * - Parameterized SQL
+ * - Azure Search filter builder
+ * - Sorting & Pagination
+ * - Switchable data source
+ */
+public class MultiSourceQueryDemo {
+
+    /* ============================================================
+       =============== 1️⃣ ANNOTATIONS =============================
+       ============================================================ */
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.FIELD)
+    public @interface SqlField {
+        String value();
+    }
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.FIELD)
+    public @interface SearchField {
+        String value();
+    }
+
+    /* ============================================================
+       =============== 2️⃣ SAMPLE MODEL ============================
+       ============================================================ */
+
+    public static class User {
+
+        @SqlField("user_id")
+        @SearchField("userId")
+        private String id;
+
+        @SqlField("user_name")
+        @SearchField("displayName")
+        private String name;
+
+        @SqlField("email_address")
+        @SearchField("email")
+        private String email;
+
+        @SqlField("age_years")
+        @SearchField("age")
+        private Integer age;
+    }
+
+    /* ============================================================
+       =============== 3️⃣ CORE TYPES ==============================
+       ============================================================ */
+
+    public enum DataSourceType {
+        SQL,
+        AZURE_SEARCH
+    }
+
+    public enum Operator {
+        EQ, CONTAINS, STARTS_WITH, GT, LT
+    }
+
+    public static class FilterCriteria {
+        String field;
+        Operator operator;
+        Object value;
+
+        public FilterCriteria(String field, Operator operator, Object value) {
+            this.field = field;
+            this.operator = operator;
+            this.value = value;
+        }
+    }
+
+    public static class SortCriteria {
+        String field;
+        boolean ascending;
+
+        public SortCriteria(String field, boolean ascending) {
+            this.field = field;
+            this.ascending = ascending;
+        }
+    }
+
+    /* ============================================================
+       =============== 4️⃣ FIELD MAPPER (CACHED) ==================
+       ============================================================ */
+
+    public static class FieldMapper {
+
+        private static final Map<String, Map<String, String>> CACHE = new ConcurrentHashMap<>();
+
+        public static Map<String, String> getFieldMapping(Class<?> clazz, DataSourceType source) {
+
+            String key = clazz.getName() + "_" + source.name();
+
+            return CACHE.computeIfAbsent(key, k -> {
+                Map<String, String> mapping = new HashMap<>();
+
+                for (Field field : clazz.getDeclaredFields()) {
+
+                    switch (source) {
+                        case SQL:
+                            if (field.isAnnotationPresent(SqlField.class)) {
+                                mapping.put(field.getName(),
+                                        field.getAnnotation(SqlField.class).value());
+                            }
+                            break;
+
+                        case AZURE_SEARCH:
+                            if (field.isAnnotationPresent(SearchField.class)) {
+                                mapping.put(field.getName(),
+                                        field.getAnnotation(SearchField.class).value());
+                            }
+                            break;
+                    }
+                }
+                return mapping;
+            });
+        }
+    }
+
+    /* ============================================================
+       =============== 5️⃣ QUERY RESULT WRAPPER ===================
+       ============================================================ */
+
+    public static class QueryResult {
+        private final String query;
+        private final List<Object> parameters;
+
+        public QueryResult(String query, List<Object> parameters) {
+            this.query = query;
+            this.parameters = parameters;
+        }
+
+        public String getQuery() { return query; }
+        public List<Object> getParameters() { return parameters; }
+    }
+
+    /* ============================================================
+       =============== 6️⃣ QUERY BUILDER INTERFACE =================
+       ============================================================ */
+
+    public interface QueryBuilder {
+        QueryResult buildQuery(
+                List<FilterCriteria> filters,
+                List<SortCriteria> sorts,
+                int page,
+                int size
+        );
+    }
+
+    /* ============================================================
+       =============== 7️⃣ SQL QUERY BUILDER =======================
+       ============================================================ */
+
+    public static class SqlQueryBuilder implements QueryBuilder {
+
+        private final Map<String, String> mapping;
+        private final String tableName;
+
+        public SqlQueryBuilder(Class<?> modelClass, String tableName) {
+            this.mapping = FieldMapper.getFieldMapping(modelClass, DataSourceType.SQL);
+            this.tableName = tableName;
+        }
+
+        @Override
+        public QueryResult buildQuery(List<FilterCriteria> filters,
+                                      List<SortCriteria> sorts,
+                                      int page,
+                                      int size) {
+
+            StringBuilder sql = new StringBuilder("SELECT * FROM " + tableName);
+            List<Object> params = new ArrayList<>();
+
+            if (!filters.isEmpty()) {
+                sql.append(" WHERE ");
+
+                List<String> conditions = new ArrayList<>();
+
+                for (FilterCriteria filter : filters) {
+                    String column = mapping.get(filter.field);
+
+                    switch (filter.operator) {
+                        case EQ:
+                            conditions.add(column + " = ?");
+                            params.add(filter.value);
+                            break;
+                        case CONTAINS:
+                            conditions.add(column + " LIKE ?");
+                            params.add("%" + filter.value + "%");
+                            break;
+                        case STARTS_WITH:
+                            conditions.add(column + " LIKE ?");
+                            params.add(filter.value + "%");
+                            break;
+                        case GT:
+                            conditions.add(column + " > ?");
+                            params.add(filter.value);
+                            break;
+                        case LT:
+                            conditions.add(column + " < ?");
+                            params.add(filter.value);
+                            break;
+                    }
+                }
+
+                sql.append(String.join(" AND ", conditions));
+            }
+
+            if (!sorts.isEmpty()) {
+                sql.append(" ORDER BY ");
+                sql.append(
+                        sorts.stream()
+                                .map(s -> mapping.get(s.field) + (s.ascending ? " ASC" : " DESC"))
+                                .collect(Collectors.joining(", "))
+                );
+            }
+
+            sql.append(" LIMIT ? OFFSET ?");
+            params.add(size);
+            params.add(page * size);
+
+            return new QueryResult(sql.toString(), params);
+        }
+    }
+
+    /* ============================================================
+       =============== 8️⃣ AZURE SEARCH BUILDER ====================
+       ============================================================ */
+
+    public static class AzureSearchQueryBuilder implements QueryBuilder {
+
+        private final Map<String, String> mapping;
+
+        public AzureSearchQueryBuilder(Class<?> modelClass) {
+            this.mapping = FieldMapper.getFieldMapping(modelClass, DataSourceType.AZURE_SEARCH);
+        }
+
+        @Override
+        public QueryResult buildQuery(List<FilterCriteria> filters,
+                                      List<SortCriteria> sorts,
+                                      int page,
+                                      int size) {
+
+            StringBuilder query = new StringBuilder();
+            List<Object> dummyParams = Collections.emptyList(); // Not used for Azure
+
+            if (!filters.isEmpty()) {
+
+                List<String> filterExpressions = new ArrayList<>();
+
+                for (FilterCriteria filter : filters) {
+                    String field = mapping.get(filter.field);
+
+                    switch (filter.operator) {
+                        case EQ:
+                            filterExpressions.add(field + " eq '" + filter.value + "'");
+                            break;
+                        case CONTAINS:
+                            filterExpressions.add("contains(" + field + ",'" + filter.value + "')");
+                            break;
+                        case STARTS_WITH:
+                            filterExpressions.add("startswith(" + field + ",'" + filter.value + "')");
+                            break;
+                        case GT:
+                            filterExpressions.add(field + " gt " + filter.value);
+                            break;
+                        case LT:
+                            filterExpressions.add(field + " lt " + filter.value);
+                            break;
+                    }
+                }
+
+                query.append("$filter=")
+                        .append(String.join(" and ", filterExpressions));
+            }
+
+            if (!sorts.isEmpty()) {
+                query.append("&$orderby=");
+                query.append(
+                        sorts.stream()
+                                .map(s -> mapping.get(s.field) + (s.ascending ? " asc" : " desc"))
+                                .collect(Collectors.joining(", "))
+                );
+            }
+
+            query.append("&$top=").append(size);
+            query.append("&$skip=").append(page * size);
+
+            return new QueryResult(query.toString(), dummyParams);
+        }
+    }
+
+    /* ============================================================
+       =============== 9️⃣ FACTORY ================================
+       ============================================================ */
+
+    public static QueryBuilder getBuilder(DataSourceType type) {
+        switch (type) {
+            case SQL:
+                return new SqlQueryBuilder(User.class, "users_table");
+            case AZURE_SEARCH:
+                return new AzureSearchQueryBuilder(User.class);
+            default:
+                throw new IllegalArgumentException("Unsupported source");
+        }
+    }
+
+    /* ============================================================
+       =============== 🔟 DEMO MAIN ================================
+       ============================================================ */
+
+    public static void main(String[] args) {
+
+        List<FilterCriteria> filters = Arrays.asList(
+                new FilterCriteria("name", Operator.CONTAINS, "John"),
+                new FilterCriteria("age", Operator.GT, 25)
+        );
+
+        List<SortCriteria> sorts = Arrays.asList(
+                new SortCriteria("age", false)
+        );
+
+        // 🔁 Switch source here
+        DataSourceType source = DataSourceType.SQL;
+        // DataSourceType source = DataSourceType.AZURE_SEARCH;
+
+        QueryBuilder builder = getBuilder(source);
+
+        QueryResult result = builder.buildQuery(filters, sorts, 0, 10);
+
+        System.out.println("Query:");
+        System.out.println(result.getQuery());
+
+        if (!result.getParameters().isEmpty()) {
+            System.out.println("Parameters:");
+            System.out.println(result.getParameters());
+        }
+    }
+}
