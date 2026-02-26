@@ -1,0 +1,23 @@
+@Service
+public class ProfileSearchService {
+
+    private final ReactiveRedisTemplate<String, Profile> redisTemplate;
+
+    public ProfileSearchService(ReactiveRedisTemplate<String, Profile> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    public Flux<Profile> searchProfiles(String searchText) {
+
+        return redisTemplate
+                .scan()
+                .flatMap(key ->
+                        redisTemplate.opsForValue().get(key)
+                )
+                .filter(profile ->
+                        profile.getEmail().toLowerCase().contains(searchText.toLowerCase())
+                                || profile.getName().toLowerCase().contains(searchText.toLowerCase())
+                                || profile.getDepartment().toLowerCase().contains(searchText.toLowerCase())
+                );
+    }
+}
