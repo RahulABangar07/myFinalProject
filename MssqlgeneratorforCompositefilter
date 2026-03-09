@@ -1,0 +1,405 @@
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class EnterpriseSqlQueryBuilder {
+
+    // -----------------------------
+    // ENUMS
+    // -----------------------------
+
+    enum DataType {
+        STRING, INT, LONG, DOUBLE, BOOLEAN, DATE
+    }
+
+    enum Operator {
+
+        EQ("="),
+        NE("!="),
+        GT(">"),
+        LT("<"),
+        GTE(">="),
+        LTE("<="),
+        LIKE("LIKE"),
+        IN("IN"),
+        NOT_IN("NOT IN"),
+        BETWEEN("BETWEEN");
+
+        private final String sql;
+
+        Operator(String sql) {
+            this.sql = sql;
+        }
+
+        public String getSql() {
+            return sql;
+        }
+    }
+
+    enum LogicalOperator {
+        AND, OR
+    }
+
+    enum JoinType {
+        INNER, LEFT, RIGHT
+    }
+
+    // -----------------------------
+    // Query Result (SQL + Params)
+    // -----------------------------
+
+    static class QueryResult {
+
+        String sql;
+        List<Object> parameters;
+
+        QueryResult(String sql, List<Object> parameters) {
+            this.sql = sql;
+            this.parameters = parameters;
+        }
+    }
+
+    // -----------------------------
+    // Filter Interface
+    // -----------------------------
+
+    interface Filter {
+        QueryResult toSql();
+    }
+
+    // -----------------------------
+    // CONDITION (Leaf Node)
+    // -----------------------------
+
+    static class Condition implements Filter {
+
+        String field;
+        DataType type;
+        Object value;
+        Operator operator;
+        boolean isArray;
+
+        Condition(String field,
+                  DataType type,
+                  Object value,
+                  Operator operator,
+                  boolean isArray) {
+
+            this.field = field;
+            this.type = type;
+            this.value = value;
+            this.operator = operator;
+            this.isArray = isArray;
+        }
+
+        @Override
+        public QueryResult toSql() {
+
+            List<Object> params = new ArrayList<>();
+
+            if (isArray && value instanceof Collection<?> list) {
+
+                String placeholders = list.stream()
+                        .map(v -> "?")
+                        .collect(Collectors.joining(","));
+
+                params.addAll(list);
+
+                String sql = field + " IN (" + placeholders + ")";
+
+                return new QueryResult(sql, params);
+            }
+
+            if (operator == Operator.BETWEEN && value instanceof List<?> range && range.size() == 2) {
+
+                params.add(range.get(0));
+                params.add(range.get(1));
+
+                return new QueryResult(field + " BETWEEN ? AND ?", params);
+            }
+
+            params.add(value);
+
+            return new QueryResult(field + " " + operator.getSql() + " ?", params);
+        }
+    }
+
+    // -----------------------------
+    // COMPOSITE FILTER
+    // -----------------------------
+
+    static class CompositeFilter implements Filter {
+
+        List<Filter> filters = new ArrayList<>();
+        LogicalOperator logicalOperator;
+
+        CompositeFilter(LogicalOperator logicalOperator) {
+            this.logicalOperator = logicalOperator;
+        }
+
+        void add(Filter filter) {
+            filters.add(filter);
+        }
+
+        @Override
+        public QueryResult toSql() {
+
+            List<String> parts = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+
+            for (Filter filter : filters) {
+
+                QueryResult r = filter.toSql();
+
+                if (!r.sql.isEmpty()) {
+                    parts.add(r.sql);
+                    params.addAll(r.parameters);
+                }
+            }
+
+            String joined = String.join(" " + logicalOperator.name() + " ", parts);
+
+            return new QueryResult("(" + joined + ")", params);
+        }
+    }
+
+    // -----------------------------
+    // JOIN MODEL
+    // -----------------------------
+
+    static class Join {
+
+        JoinType type;
+        String table;
+        String onCondition;
+
+        Join(JoinType type, String table, String onCondition) {
+            this.type = type;
+            this.table = table;
+            this.onCondition = onCondition;
+        }
+
+        String toSql() {
+            return type.name() + " JOIN " + table + " ON " + onCondition;
+        }
+    }
+
+    // -----------------------------
+    // ORDER BY MODEL
+    // -----------------------------
+
+    static class OrderBy {
+
+        String column;
+        boolean asc;
+
+        OrderBy(String column, boolean asc) {
+            this.column = column;
+            this.asc = asc;
+        }
+
+        String toSql() {
+            return column + (asc ? " ASC" : " DESC");
+        }
+    }
+
+    // -----------------------------
+    // MAIN QUERY BUILDER
+    // -----------------------------
+
+    static class SqlQueryBuilder {
+
+        String table;
+
+        List<String> columns = new ArrayList<>();
+
+        List<Join> joins = new ArrayList<>();
+
+        CompositeFilter filter;
+
+        List<OrderBy> orderByList = new ArrayList<>();
+
+        Integer limit;
+
+        Integer offset;
+
+        SqlQueryBuilder(String table) {
+            this.table = table;
+        }
+
+        public SqlQueryBuilder select(String... cols) {
+            columns.addAll(Arrays.asList(cols));
+            return this;
+        }
+
+        public SqlQueryBuilder join(JoinType type, String table, String on) {
+            joins.add(new Join(type, table, on));
+            return this;
+        }
+
+        public SqlQueryBuilder where(CompositeFilter filter) {
+            this.filter = filter;
+            return this;
+        }
+
+        public SqlQueryBuilder orderBy(String column, boolean asc) {
+            orderByList.add(new OrderBy(column, asc));
+            return this;
+        }
+
+        public SqlQueryBuilder limit(int limit) {
+            this.limit = limit;
+            return this;
+        }
+
+        public SqlQueryBuilder offset(int offset) {
+            this.offset = offset;
+            return this;
+        }
+
+        public QueryResult build() {
+
+            StringBuilder sql = new StringBuilder();
+
+            List<Object> params = new ArrayList<>();
+
+            // SELECT
+
+            if (columns.isEmpty())
+                sql.append("SELECT * ");
+            else
+                sql.append("SELECT ").append(String.join(",", columns)).append(" ");
+
+            // FROM
+
+            sql.append("FROM ").append(table).append(" ");
+
+            // JOINS
+
+            for (Join j : joins) {
+                sql.append(j.toSql()).append(" ");
+            }
+
+            // WHERE
+
+            if (filter != null) {
+
+                QueryResult r = filter.toSql();
+
+                if (!r.sql.isEmpty()) {
+
+                    sql.append("WHERE ").append(r.sql).append(" ");
+                    params.addAll(r.parameters);
+                }
+            }
+
+            // ORDER BY
+
+            if (!orderByList.isEmpty()) {
+
+                String orderSql = orderByList.stream()
+                        .map(OrderBy::toSql)
+                        .collect(Collectors.joining(","));
+
+                sql.append("ORDER BY ").append(orderSql).append(" ");
+            }
+
+            // PAGINATION
+
+            if (limit != null) {
+                sql.append("OFFSET ").append(offset == null ? 0 : offset)
+                        .append(" ROWS FETCH NEXT ")
+                        .append(limit)
+                        .append(" ROWS ONLY ");
+            }
+
+            return new QueryResult(sql.toString().trim(), params);
+        }
+    }
+
+    // -----------------------------
+    // JSON FILTER CONVERTER
+    // -----------------------------
+
+    static class JsonFilterParser {
+
+        public static Filter parse(Map<String, Object> json) {
+
+            if (json.containsKey("and") || json.containsKey("or")) {
+
+                LogicalOperator op = json.containsKey("and")
+                        ? LogicalOperator.AND
+                        : LogicalOperator.OR;
+
+                List<Map<String, Object>> children =
+                        (List<Map<String, Object>>) json.get(op == LogicalOperator.AND ? "and" : "or");
+
+                CompositeFilter cf = new CompositeFilter(op);
+
+                for (Map<String, Object> child : children) {
+                    cf.add(parse(child));
+                }
+
+                return cf;
+            }
+
+            String field = (String) json.get("field");
+            String operator = (String) json.get("operator");
+            Object value = json.get("value");
+
+            return new Condition(
+                    field,
+                    DataType.STRING,
+                    value,
+                    Operator.valueOf(operator),
+                    value instanceof Collection
+            );
+        }
+    }
+
+    // -----------------------------
+    // DEMO MAIN METHOD
+    // -----------------------------
+
+    public static void main(String[] args) {
+
+        Condition age = new Condition("u.age", DataType.INT, 30, Operator.GT, false);
+
+        Condition country = new Condition("u.country", DataType.STRING, "India", Operator.EQ, false);
+
+        Condition salary = new Condition("s.salary", DataType.INT, 50000, Operator.GT, false);
+
+        Condition dept = new Condition(
+                "d.name",
+                DataType.STRING,
+                List.of("IT", "HR", "Finance"),
+                Operator.IN,
+                true
+        );
+
+        CompositeFilter inner = new CompositeFilter(LogicalOperator.AND);
+        inner.add(age);
+        inner.add(country);
+
+        CompositeFilter root = new CompositeFilter(LogicalOperator.OR);
+        root.add(inner);
+        root.add(salary);
+        root.add(dept);
+
+        SqlQueryBuilder builder = new SqlQueryBuilder("users u")
+                .select("u.id", "u.name", "d.name", "s.salary")
+                .join(JoinType.LEFT, "departments d", "u.dept_id = d.id")
+                .join(JoinType.LEFT, "salaries s", "u.id = s.user_id")
+                .where(root)
+                .orderBy("s.salary", false)
+                .limit(10)
+                .offset(0);
+
+        QueryResult result = builder.build();
+
+        System.out.println("SQL:");
+        System.out.println(result.sql);
+
+        System.out.println("\nParameters:");
+        System.out.println(result.parameters);
+    }
+}
