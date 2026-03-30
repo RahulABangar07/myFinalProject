@@ -1,0 +1,297 @@
+package com.example.search;
+
+import com.azure.core.credential.AzureKeyCredential;
+import com.azure.search.documents.SearchAsyncClient;
+import com.azure.search.documents.SearchClientBuilder;
+import com.azure.search.documents.models.SearchOptions;
+import com.azure.search.documents.models.SearchResult;
+import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/search")
+public class ReactiveSearchController {
+
+    private final ReactiveSearchService service;
+
+    public ReactiveSearchController() {
+        // Initialize Azure client (configure properly)
+        SearchAsyncClient client = new SearchClientBuilder()
+                .endpoint("<endpoint>")
+                .credential(new AzureKeyCredential("<key>"))
+                .indexName("<index-name>")
+                .buildAsyncClient();
+
+        this.service = new ReactiveSearchService(client);
+    }
+
+    @GetMapping
+    public Flux<Map<String, Object>> search(@RequestParam String filter) {
+        return service.search(filter);
+    }
+
+    // ================= SERVICE =================
+
+    @Service
+    static class ReactiveSearchService {
+
+        private final SearchAsyncClient client;
+        private final FilterEvaluationService evaluationService = new FilterEvaluationService();
+
+        public ReactiveSearchService(SearchAsyncClient client) {
+            this.client = client;
+        }
+
+        public Flux<Map<String, Object>> search(String filter) {
+
+            List<Expr> expressions = evaluationService.buildExpressions(filter);
+
+            return client.search("*", new SearchOptions().setFilter(filter))
+                    .map(result -> {
+                        Map<String, Object> doc = result.getDocument();
+
+                        List<String> matched =
+                                evaluationService.evaluate(doc, expressions);
+
+                        Map<String, Object> response = new HashMap<>();
+                        response.put("id", doc.get("id"));
+                        response.put("matchedConditions", matched);
+
+                        return response;
+                    });
+        }
+    }
+
+    // ================= EVALUATION SERVICE =================
+
+    static class FilterEvaluationService {
+
+        private final FilterSplitter splitter = new FilterSplitter();
+        private final ClauseParser clauseParser = new ClauseParser();
+
+        public List<Expr> buildExpressions(String filter) {
+            return splitter.splitTopLevelOr(filter)
+                    .stream()
+                    .map(clauseParser::parseClause)
+                    .collect(Collectors.toList());
+        }
+
+        public List<String> evaluate(Map<String, Object> doc, List<Expr> expressions) {
+            return expressions.stream()
+                    .filter(expr -> expr.evaluate(doc))
+                    .map(Expr::asString)
+                    .collect(Collectors.toList());
+        }
+    }
+
+    // ================= FILTER SPLITTER =================
+
+    static class FilterSplitter {
+
+        public List<String> splitTopLevelOr(String filter) {
+            List<String> parts = new ArrayList<>();
+            int depth = 0;
+            StringBuilder current = new StringBuilder();
+
+            for (char c : filter.toCharArray()) {
+                if (c == '(') depth++;
+                if (c == ')') depth--;
+
+                if (depth == 0 && current.toString().endsWith(" or")) {
+                    parts.add(current.substring(0, current.length() - 3).trim());
+                    current = new StringBuilder();
+                }
+
+                current.append(c);
+            }
+
+            if (!current.isEmpty()) {
+                parts.add(current.toString().trim());
+            }
+
+            return parts;
+        }
+    }
+
+    // ================= CLAUSE PARSER =================
+
+    static class ClauseParser {
+
+        private final ConditionParser conditionParser = new ConditionParser();
+
+        public Expr parseClause(String clause) {
+            clause = clause.replaceAll("[()]", "").trim();
+
+            if (clause.contains(" and ")) {
+                List<Expr> children = Arrays.stream(clause.split(" and "))
+                        .map(this::parseConditionExpr)
+                        .toList();
+                return new AndExpr(children);
+            }
+
+            return parseConditionExpr(clause);
+        }
+
+        private Expr parseConditionExpr(String exp) {
+            return new ComparisonExpr(conditionParser.parse(exp));
+        }
+    }
+
+    // ================= CONDITION PARSER =================
+
+    static class ConditionParser {
+
+        public Condition parse(String expression) {
+            expression = expression.trim();
+
+            if (expression.contains(" notin ")) {
+                String[] parts = expression.split(" notin ");
+                return new Condition(
+                        parts[0].trim(),
+                        FilterType.NOT_IN,
+                        parseList(parts[1])
+                );
+            }
+
+            if (expression.contains(" in ")) {
+                String[] parts = expression.split(" in ");
+                return new Condition(
+                        parts[0].trim(),
+                        FilterType.IN,
+                        parseList(parts[1])
+                );
+            }
+
+            String[] parts = expression.split(" ");
+            String field = parts[0];
+            String op = parts[1];
+            String value = parts[2].replace("'", "");
+
+            return new Condition(field, mapOperator(op), List.of(value));
+        }
+
+        private List<String> parseList(String raw) {
+            return Arrays.stream(
+                    raw.replaceAll("[()']", "").split(",")
+            ).map(String::trim).toList();
+        }
+
+        private FilterType mapOperator(String op) {
+            return switch (op) {
+                case "eq" -> FilterType.EQ;
+                case "gt" -> FilterType.GT;
+                case "lt" -> FilterType.LT;
+                default -> throw new IllegalArgumentException("Unsupported operator: " + op);
+            };
+        }
+    }
+
+    // ================= MODEL =================
+
+    enum FilterType {
+        EQ, GT, LT, IN, NOT_IN
+    }
+
+    static class Condition {
+        private final String field;
+        private final FilterType operator;
+        private final List<String> values;
+
+        public Condition(String field, FilterType operator, List<String> values) {
+            this.field = field;
+            this.operator = operator;
+            this.values = values;
+        }
+
+        public String getField() { return field; }
+        public FilterType getOperator() { return operator; }
+        public List<String> getValues() { return values; }
+    }
+
+    // ================= EXPRESSION =================
+
+    interface Expr {
+        boolean evaluate(Map<String, Object> doc);
+        String asString();
+    }
+
+    static class ComparisonExpr implements Expr {
+
+        private final Condition condition;
+
+        public ComparisonExpr(Condition condition) {
+            this.condition = condition;
+        }
+
+        @Override
+        public boolean evaluate(Map<String, Object> doc) {
+            Object fieldValue = doc.get(condition.getField());
+            if (fieldValue == null) return false;
+
+            String value = fieldValue.toString();
+
+            return switch (condition.getOperator()) {
+                case EQ -> value.equalsIgnoreCase(condition.getValues().get(0));
+
+                case GT -> Double.parseDouble(value) >
+                        Double.parseDouble(condition.getValues().get(0));
+
+                case LT -> Double.parseDouble(value) <
+                        Double.parseDouble(condition.getValues().get(0));
+
+                case IN -> condition.getValues().stream()
+                        .anyMatch(v -> v.equalsIgnoreCase(value));
+
+                case NOT_IN -> condition.getValues().stream()
+                        .noneMatch(v -> v.equalsIgnoreCase(value));
+            };
+        }
+
+        @Override
+        public String asString() {
+            return condition.getField() + " " + condition.getOperator();
+        }
+    }
+
+    static class AndExpr implements Expr {
+
+        private final List<Expr> children;
+
+        public AndExpr(List<Expr> children) {
+            this.children = children;
+        }
+
+        @Override
+        public boolean evaluate(Map<String, Object> doc) {
+            return children.stream().allMatch(c -> c.evaluate(doc));
+        }
+
+        @Override
+        public String asString() {
+            return "AND";
+        }
+    }
+
+    static class OrExpr implements Expr {
+
+        private final List<Expr> children;
+
+        public OrExpr(List<Expr> children) {
+            this.children = children;
+        }
+
+        @Override
+        public boolean evaluate(Map<String, Object> doc) {
+            return children.stream().anyMatch(c -> c.evaluate(doc));
+        }
+
+        @Override
+        public String asString() {
+            return "OR";
+        }
+    }
+}
