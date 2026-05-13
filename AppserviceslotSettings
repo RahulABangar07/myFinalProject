@@ -1,0 +1,453 @@
+```yaml
+# ============================================================
+# COMPLETE ISTIO + AKS + APP SERVICE SLOT ROUTING SETUP
+# ============================================================
+#
+# GOAL
+# ----
+# Production App Service Slot  -> customer-service V1
+# Staging App Service Slot     -> customer-service V2
+#
+# NO CODE CHANGES REQUIRED
+# ------------------------
+# - No Java code changes
+# - No UI code changes
+# - No API changes
+#
+# TECHNOLOGIES
+# ------------
+# - Azure App Service Slots
+# - AKS
+# - Istio Service Mesh
+# - NGINX Ingress / Istio Ingress Gateway
+#
+# ============================================================
+# ARCHITECTURE
+# ============================================================
+#
+#                 Azure App Service
+#              -----------------------
+#              |                     |
+#         Production Slot      Staging Slot
+#              |                     |
+#         No Header             x-slot=staging
+#              |                     |
+#              -----------------------
+#                         |
+#                    AKS Ingress
+#                         |
+#                       Istio
+#                         |
+#          --------------------------------
+#          |                              |
+#      customer-service-v1         customer-service-v2
+#
+# ============================================================
+# STEP 1 - DEPLOY CUSTOMER SERVICE V1
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-service-v1
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: customer-service
+      version: v1
+
+  template:
+    metadata:
+      labels:
+        app: customer-service
+        version: v1
+
+    spec:
+      containers:
+      - name: customer-service
+
+        # CHANGE IMAGE
+        image: myacr.azurecr.io/customer-service:v1
+
+        ports:
+        - containerPort: 8080
+
+---
+# ============================================================
+# STEP 2 - DEPLOY CUSTOMER SERVICE V2
+# ============================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-service-v2
+  namespace: default
+
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: customer-service
+      version: v2
+
+  template:
+    metadata:
+      labels:
+        app: customer-service
+        version: v2
+
+    spec:
+      containers:
+      - name: customer-service
+
+        # CHANGE IMAGE
+        image: myacr.azurecr.io/customer-service:v2
+
+        ports:
+        - containerPort: 8080
+
+---
+# ============================================================
+# STEP 3 - SINGLE STABLE KUBERNETES SERVICE
+# ============================================================
+#
+# IMPORTANT:
+# ONE service for BOTH versions.
+# Istio handles routing internally.
+#
+# ============================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-service
+  namespace: default
+
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+
+  selector:
+    app: customer-service
+
+---
+# ============================================================
+# STEP 4 - ISTIO DESTINATION RULE
+# ============================================================
+#
+# Defines subsets:
+# - v1
+# - v2
+#
+# Based on pod labels.
+#
+# ============================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+
+metadata:
+  name: customer-service
+  namespace: default
+
+spec:
+  host: customer-service
+
+  subsets:
+
+  - name: v1
+    labels:
+      version: v1
+
+  - name: v2
+    labels:
+      version: v2
+
+---
+# ============================================================
+# STEP 5 - ISTIO VIRTUAL SERVICE
+# ============================================================
+#
+# ROUTING RULES
+# -------------
+#
+# IF HEADER:
+#   x-slot=staging
+#
+# THEN:
+#   Route to V2
+#
+# OTHERWISE:
+#   Route to V1
+#
+# ============================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+
+metadata:
+  name: customer-service
+  namespace: default
+
+spec:
+  hosts:
+  - customer-service
+
+  http:
+
+  # ==========================================================
+  # STAGING SLOT -> V2
+  # ==========================================================
+  - match:
+    - headers:
+        x-slot:
+          exact: staging
+
+    route:
+    - destination:
+        host: customer-service
+        subset: v2
+
+  # ==========================================================
+  # DEFAULT -> V1
+  # ==========================================================
+  - route:
+    - destination:
+        host: customer-service
+        subset: v1
+
+---
+# ============================================================
+# STEP 6 - ISTIO INGRESS GATEWAY
+# ============================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+
+metadata:
+  name: customer-gateway
+  namespace: default
+
+spec:
+  selector:
+    istio: ingressgateway
+
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+
+    hosts:
+    - "*"
+
+---
+# ============================================================
+# STEP 7 - EXPOSE THROUGH GATEWAY
+# ============================================================
+
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+
+metadata:
+  name: customer-gateway-routing
+  namespace: default
+
+spec:
+  hosts:
+  - "*"
+
+  gateways:
+  - customer-gateway
+
+  http:
+  - match:
+    - uri:
+        prefix: /customer
+
+    route:
+    - destination:
+        host: customer-service
+        port:
+          number: 80
+
+# ============================================================
+# APP SERVICE SLOT CONFIGURATION
+# ============================================================
+#
+# PRODUCTION SLOT
+# ----------------
+# URL:
+#   https://app.company.com
+#
+# NO HEADER REQUIRED
+#
+# RESULT:
+#   Routed to V1
+#
+#
+# STAGING SLOT
+# -------------
+# URL:
+#   https://app-staging.company.com
+#
+# ADD HEADER:
+#   x-slot: staging
+#
+# RESULT:
+#   Routed to V2
+#
+# ============================================================
+
+# ============================================================
+# OPTION 1 - AZURE FRONT DOOR HEADER INJECTION (RECOMMENDED)
+# ============================================================
+#
+# RULE:
+#
+# IF HOSTNAME CONTAINS:
+#   staging
+#
+# THEN ADD HEADER:
+#
+#   x-slot = staging
+#
+# ============================================================
+
+# Example Front Door Rule Logic:
+#
+# Match:
+#   Request hostname contains "staging"
+#
+# Action:
+#   Add request header:
+#
+#     Header Name: x-slot
+#     Header Value: staging
+#
+
+# ============================================================
+# OPTION 2 - NGINX INGRESS HEADER INJECTION
+# ============================================================
+
+#
+# Example:
+#
+# nginx.ingress.kubernetes.io/configuration-snippet: |
+#   proxy_set_header x-slot staging;
+#
+
+# ============================================================
+# DEPLOYMENT COMMANDS
+# ============================================================
+
+#
+# Install Istio:
+#
+#   istioctl install
+#
+#
+# Enable Sidecar Injection:
+#
+#   kubectl label namespace default istio-injection=enabled
+#
+#
+# Apply Configurations:
+#
+#   kubectl apply -f complete-setup.yaml
+#
+#
+# Verify Pods:
+#
+#   kubectl get pods
+#
+#
+# Verify Virtual Services:
+#
+#   kubectl get virtualservice
+#
+#
+# Verify Destination Rules:
+#
+#   kubectl get destinationrule
+#
+#
+# Check Ingress Gateway:
+#
+#   kubectl get svc istio-ingressgateway -n istio-system
+#
+#
+# ============================================================
+# TESTING
+# ============================================================
+#
+# DEFAULT ROUTE -> V1
+#
+# curl http://gateway-ip/customer/api
+#
+#
+# STAGING ROUTE -> V2
+#
+# curl -H "x-slot: staging" http://gateway-ip/customer/api
+#
+#
+# ============================================================
+# IMPORTANT PRODUCTION CONSIDERATIONS
+# ============================================================
+#
+# 1. DATABASE
+# ------------
+# Use backward-compatible schema migrations.
+#
+#
+# 2. SESSIONS
+# ------------
+# Use:
+# - JWT
+# OR
+# - Redis shared sessions
+#
+#
+# 3. OBSERVABILITY
+# ----------------
+# Recommended:
+# - Prometheus
+# - Grafana
+# - Jaeger
+# - Azure Monitor
+#
+#
+# 4. CANARY SUPPORT
+# -----------------
+# Later you can gradually shift traffic:
+#
+# route:
+# - destination:
+#     subset: v1
+#   weight: 90
+#
+# - destination:
+#     subset: v2
+#   weight: 10
+#
+#
+# ============================================================
+# FINAL RESULT
+# ============================================================
+#
+# https://app.company.com
+#   -> customer-service-v1
+#
+# https://app-staging.company.com
+#   -> customer-service-v2
+#
+# NO CODE CHANGES ANYWHERE
+#
+# ============================================================
+```
