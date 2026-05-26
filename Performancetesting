@@ -1,0 +1,60 @@
+<dependency>
+    <groupId>io.gatling.highcharts</groupId>
+    <artifactId>gatling-charts-highcharts</artifactId>
+    <version>3.11.5</version>
+    <scope>test</scope>
+</dependency>
+
+
+
+import io.gatling.javaapi.core.*;
+import io.gatling.javaapi.http.*;
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.http.HttpDsl.*;
+
+public class MicroservicePerformanceTest extends Simulation {
+
+    // 1. Configure the base URL for your microservice
+    private HttpProtocolBuilder httpProtocol = http
+        .baseUrl("http://localhost:8080")
+        .acceptHeader("application/json")
+        .contentTypeHeader("application/json");
+
+    // 2. Scenario to log in and capture the Bearer Token
+    private ScenarioBuilder loadTestScenario = scenario("Authenticated Microservice Load Test")
+        // Step A: Call your Auth endpoint to grab a fresh token
+        .exec(http("Authentication Request")
+            .post("/api/v1/auth/login")
+            .body(StringBody("{\"username\": \"test_user\", \"password\": \"secure_password\"}"))
+            // Extract the token from JSON response (e.g., {"token": "eyJ..."}) and save to session memory
+            .check(jsonPath("$.token").saveAs("jwtToken")) 
+        )
+        .pause(1) // Think time simulation (1 second)
+
+        // Step B: Call your secure APIs using the captured Bearer token
+        .exec(http("Get Secured Resources")
+            .get("/api/v1/secured-data")
+            // Dynamically inject the Bearer token from the session memory variable
+            .header("Authorization", "Bearer #{jwtToken}") 
+        )
+        .pause(2)
+
+        .exec(http("Post Secured Transaction")
+            .post("/api/v1/transactions")
+            .header("Authorization", "Bearer #{jwtToken}")
+            .body(StringBody("{\"amount\": 150.00, \"currency\": \"USD\"}"))
+        );
+
+    // 3. Define the Load Profile (50 concurrent users)
+    {
+        setUp(
+            loadTestScenario.injectOpen(
+                // Option A: Ramp up to 50 users over 30 seconds (Recommended to avoid sudden traffic spikes)
+                rampUsers(50).during(30) 
+                
+                // Option B: Uncomment below to inject all 50 users instantly at the exact same second
+                // atOnceUsers(50) 
+            )
+        ).protocols(httpProtocol);
+    }
+}
