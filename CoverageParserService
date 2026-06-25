@@ -1,0 +1,53 @@
+package com.example.mcp.service;
+
+import org.springframework.stereotype.Service;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.File;
+
+@Service
+public class CoverageParserService {
+
+    /**
+     * Extracts overall instruction coverage from JaCoCo XML report.
+     * Formula: Covered / (Missed + Covered) * 100
+     */
+    public double calculateOverallInstructionCoverage(String localRepoPath) {
+        try {
+            File xmlFile = new File(localRepoPath + "/target/site/jacoco/jacoco.xml");
+            if (!xmlFile.exists()) {
+                System.err.println("JaCoCo execution artifact target not found at: " + xmlFile.getAbsolutePath());
+                return 0.0;
+            }
+
+            DocumentBuilderFactory dbFactory = DocumentBuilderFactory.newInstance();
+            // Secure XML parser configuration against XXE injections
+            dbFactory.setFeature("http://apache.org", true);
+            DocumentBuilder dBuilder = dbFactory.newDocumentBuilder();
+            Document doc = dBuilder.parse(xmlFile);
+            doc.getDocumentElement().normalize();
+
+            // Locate base coverage counters
+            NodeList counterNodes = doc.getElementsByTagName("counter");
+            for (int i = 0; i < counterNodes.getLength(); i++) {
+                Element counter = (Element) counterNodes.item(i);
+                // Filter down explicitly to global base instruction lines
+                if ("INSTRUCTION".equals(counter.getAttribute("type"))) {
+                    double missed = Double.parseDouble(counter.getAttribute("missed"));
+                    double covered = Double.parseDouble(counter.getAttribute("covered"));
+                    double total = missed + covered;
+
+                    if (total == 0) return 100.0;
+                    return (covered / total) * 100.0;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Fatal exception extracting metrics from JaCoCo XML: " + e.getMessage());
+        }
+        return 0.0;
+    }
+}
