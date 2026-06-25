@@ -1,0 +1,131 @@
+package com.example.mcp.service;
+
+import com.example.mcp.model.FileContent;
+import org.apache.maven.shared.invoker.*;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.diff.DiffEntry;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectReader;
+import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.eclipse.jgit.treewalk.CanonicalTreeParser;
+import org.gitlab4j.api.GitLabApi;
+import org.gitlab4j.api.models.MergeRequest;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@Service
+public class GitAutomationService {
+
+    @Value("${gitlab.host-url}") private String gitlabUrl;
+    @Value("${gitlab.personal-access-token}") private String token;
+    @Value("${gitlab.project-id}") private String projectId;
+    @Value("${repo.local-path}") private String localPath;
+
+    public List<FileContent> getLatestCommitChanges() throws Exception {
+        List<FileContent> changedFiles = new ArrayList<>();
+        File repoDir = new File(localPath, ".git");
+
+        try (Repository repository = new FileRepositoryBuilder().setGitDir(repoDir).build();
+             Git git = new Git(repository);
+             RevWalk walk = new RevWalk(repository)) {
+
+            ObjectId head = repository.resolve("HEAD");
+            if (head == null) return changedFiles;
+            
+            RevCommit headCommit = walk.parseCommit(head);
+            if (headCommit.getParentCount() == 0) return changedFiles;
+            
+            RevCommit parentCommit = walk.parseCommit(headCommit.getParent(0).getId());
+
+            ObjectReader reader = repository.newObjectReader();
+            CanonicalTreeParser oldTreeIter = new CanonicalTreeParser();
+            oldTreeIter.reset(reader, parentCommit.getTree().getId());
+            CanonicalTreeParser newTreeIter = new CanonicalTreeParser();
+            newTreeIter.reset(reader, headCommit.getTree().getId());
+
+            List<DiffEntry> diffs = git.diff().setOldTree(oldTreeIter).setNewTree(newTreeIter).call();
+
+            for (DiffEntry diff : diffs) {
+                String path = diff.getNewPath();
+                // Isolate production java source classes (Skip existing testing files)
+                if (path.endsWith(".java") && !path.contains("src/test/java")) {
+                    File fullPath = new File(localPath, path);
+                    if (fullPath.exists()) {
+                        String content = Files.readString(fullPath.toPath());
+                        changedFiles.add(new FileContent(path, content));
+                    }
+                }
+            }
+        }
+        return changedFiles;
+    }
+
+    public void writeTestFile(String relativePath, String code) throws Exception {
+        Path fullPath = Paths.get(localPath, relativePath);
+        Files.createDirectories(fullPath.getParent());
+        Files.writeString(fullPath, code);
+    }
+
+    /**
+     * Executes programmatic maven clean test verification.
+     * Returns true if compile succeeds and zero break points hit.
+     */
+    public boolean runMavenTestLifecycle() {
+        InvocationRequest request = new DefaultInvocationRequest();
+        request.setPomFile(new File(localPath + "/pom.xml"));
+        request.setGoals(Collections.singletonList("clean test"));
+        request.setOutputHandler(null); // Prevents console trace cluttering
+        request.setErrorHandler(null);
+
+        Invoker invoker = new DefaultInvoker();
+        String mavenHome = System.getenv("MAVEN_HOME");
+        if (mavenHome != null) {
+            invoker.setMavenHome(new File(mavenHome));
+        }
+
+        try {
+            InvocationResult result = invoker.execute(request);
+            return result.getExitCode() == 0;
+        } catch (MavenInvocationException e) {
+            return false;
+        }
+    }
+
+    public String createGitLabMergeRequest(List<FileContent> testFiles, double calculatedCoverage) throws Exception {
+        File repoDir = new File(localPath, ".git");
+        String branchName = "mcp-test-generation-" + System.currentTimeMillis();
+
+        try (Repository repository = new FileRepositoryBuilder().setGitDir(repoDir).build();
+             Git git = new Git(repository)) {
+
+            git.checkout().setCreateBranch(true).setName(branchName).call();
+
+            for (FileContent file : testFiles) {
+                git.add().addFilepattern(file.getPath()).call();
+            }
+
+            git.commit().setMessage("test: automated generation verification passing metrics").call();
+            git.push().setRemote("origin").call();
+
+            try (GitLabApi gitLabApi = new GitLabApi(gitlabUrl, token)) {
+                String desc = String.format("Auto-generated unit tests via Spring Boot MCP Agent.\n\nVerified Core Instruction Coverage Score: %.2f%%", calculatedCoverage);
+                MergeRequest mr = gitLabApi.getMergeRequestApi().createMergeRequest(
+                        projectId, branchName, "main", "Automated Test Suite Coverage", desc,
+                        null, null, null, null, null
+                );
+                return mr.getWebUrl();
+            }
+        }
+    }
+}
