@@ -1,0 +1,106 @@
+package com.example.mcp.controller;
+
+import com.example.mcp.model.FileContent;
+import com.example.mcp.service.CoverageParserService;
+import com.example.mcp.service.GitAutomationService;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+@RestController
+@RequestMapping("/api/webhooks/gitlab")
+public class GitLabWebhookController {
+
+    private final GitAutomationService gitAutomationService;
+    private final CoverageParserService coverageParserService;
+    private final ChatClient chatClient;
+
+    @Value("${gitlab.webhook-secret-token}") private String expectedToken;
+    @Value("${repo.local-path}") private String localPath;
+    @Value("${coverage.min-required-percentage}") private double minCoverage;
+
+    public GitLabWebhookController(GitAutomationService gitAutomationService, 
+                                   CoverageParserService coverageParserService, 
+                                   ChatClient.Builder chatClientBuilder) {
+        this.gitAutomationService = gitAutomationService;
+        this.coverageParserService = coverageParserService;
+        this.chatClient = chatClientBuilder.build();
+    }
+
+    @PostMapping("/push")
+    public ResponseEntity<String> handlePushEvent(
+            @RequestHeader("X-Gitlab-Token") String token,
+            @RequestBody Map<String, Object> payload) {
+
+        // 1. Safety validation signature check
+        if (!expectedToken.equals(token)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Unauthorized Signature Token");
+        }
+
+        String ref = (String) payload.get("ref");
+        // Shield processing to avoid executing recursive branch loop cycles
+        if (ref == null || ref.contains("mcp-test-generation")) {
+            return ResponseEntity.ok("Ignored trace tracking.");
+        }
+
+        // 2. Offload processing to non-blocking async thread pools
+        CompletableFuture.runAsync(() -> {
+            try {
+                List<FileContent> changedFiles = gitAutomationService.getLatestCommitChanges();
+                if (changedFiles.isEmpty()) return;
+
+                List<FileContent> createdTestsMetadata = new ArrayList<>();
+
+                // 3. Generate individual Unit Class Tests via Configured AI
+                for (FileContent file : changedFiles) {
+                    String systemPrompt = "You are an automated JUnit 5 and Mockito specialist. Generate complete compilable test code. Output strictly standard code lines inside code blocks without conversational text wrapper.";
+                    String userPrompt = "Source Target Path: " + file.getPath() + "\n\nSource Implementation:\n" + file.getContent();
+
+                    String rawOutput = this.chatClient.prompt()
+                            .system(systemPrompt)
+                            .user(userPrompt)
+                            .call()
+                            .content();
+
+                    String sanitizedJavaCode = rawOutput.replaceAll("```java|```", "").trim();
+                    String testPath = file.getPath()
+                            .replace("src/main/java/", "src/test/java/")
+                            .replace(".java", "Test.java");
+
+                    gitAutomationService.writeTestFile(testPath, sanitizedJavaCode);
+                    createdTestsMetadata.add(new FileContent(testPath, sanitizedJavaCode));
+                }
+
+                // 4. Verification Check: Compile and execute via programmatic Maven Invoker
+                boolean executionSuccess = gitAutomationService.runMavenTestLifecycle();
+                if (!executionSuccess) {
+                    System.err.println("Rejection Triggered: The generated LLM source code failed compilation or unit runtime cycles.");
+                    return;
+                }
+
+                // 5. Verification Check: Calculate coverage thresholds via structural XML parser
+                double generatedCoverageValue = coverageParserService.calculateOverallInstructionCoverage(localPath);
+                if (generatedCoverageValue < minCoverage) {
+                    System.err.printf("Rejection Triggered: Target code coverage score standard failed. Required: %.2f%%, Evaluated: %.2f%%\n", minCoverage, generatedCoverageValue);
+                    return;
+                }
+
+                // 6. Safeguards clear. Initialize MR release
+                String mrUrl = gitAutomationService.createGitLabMergeRequest(createdTestsMetadata, generatedCoverageValue);
+                System.out.println("Automated Agent Pipeline success. Merge request launched: " + mrUrl);
+
+            } catch (Exception e) {
+                System.err.println("Fatal core internal failure inside processing loop thread: " + e.getMessage());
+            }
+        });
+
+        return ResponseEntity.accepted().body("Webhook verified. Processing background compilation suite.");
+    }
+}
