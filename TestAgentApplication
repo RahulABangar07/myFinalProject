@@ -1,0 +1,141 @@
+package com.agent.testwriter;
+
+import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.service.AiServices;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class TestAgentApplication {
+
+    private static TestGeneratorAgent agent;
+
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("❌ Error: Please provide the absolute path to your repository root folder.");
+            System.out.println("Usage: java -jar java-test-agent.jar <repo-path>");
+            System.exit(1);
+        }
+
+        String repoPathStr = args[0];
+        Path repoPath = Paths.get(repoPathStr);
+
+        if (!Files.exists(repoPath) || !Files.isDirectory(repoPath)) {
+            System.out.println("❌ Error: Provided path does not exist or is not a directory.");
+            System.exit(1);
+        }
+
+        // Retrieve API Token from environment variables
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            System.out.println("❌ Error: OPENAI_API_KEY environment variable is not set.");
+            System.exit(1);
+        }
+
+        // Initialize the LLM client
+        OpenAiChatModel model = OpenAiChatModel.builder()
+                .apiKey(apiKey)
+                .modelName("gpt-4o") // Swappable with local models or lightweight alternatives
+                .timeout(Duration.ofMinutes(2))
+                .temperature(0.1) // Low temperature for deterministic code generation
+                .build();
+
+        // Build the AI Agent
+        agent = AiServices.builder(TestGeneratorAgent.class)
+                .chatLanguageModel(model)
+                .build();
+
+        System.out.println("🚀 Starting Test Generation Agent for: " + repoPath.toAbsolutePath());
+        
+        try {
+            scanAndGenerateTests(repoPath);
+            System.out.println("🎉 Test generation sweep complete!");
+        } catch (IOException e) {
+            System.err.println("❌ Critical failure running agent loop: " + e.getMessage());
+        }
+    }
+
+    private static void scanAndGenerateTests(Path repoRoot) throws IOException {
+        Files.walk(repoRoot)
+                .filter(Files::isRegularFile)
+                .filter(path -> isSourceCodeFile(path))
+                .filter(path -> !isAlreadyATestFile(path))
+                .forEach(sourceFile -> {
+                    try {
+                        processSourceFile(repoRoot, sourceFile);
+                    } catch (Exception e) {
+                        System.err.println("⚠️ Skipped " + sourceFile.getFileName() + " due to error: " + e.getMessage());
+                    }
+                });
+    }
+
+    private static boolean isSourceCodeFile(Path path) {
+        String filename = path.toString().toLowerCase();
+        // Easily extendable to .py, .js, .ts, .go, etc.
+        return filename.endsWith(".java") || filename.endsWith(".py") || filename.endsWith(".ts") || filename.endsWith(".js");
+    }
+
+    private static boolean isAlreadyATestFile(Path path) {
+        String filename = path.getFileName().toString().toLowerCase();
+        return filename.contains("test") || filename.contains("spec");
+    }
+
+    private static void processSourceFile(Path repoRoot, Path sourceFile) throws IOException {
+        System.out.println("⚙️ Analyzing: " + repoRoot.relativize(sourceFile));
+        
+        String content = Files.readString(sourceFile);
+        String contextPayload = String.format("File Name: %s\nRelative Path: %s\n\nCode:\n%s", 
+                sourceFile.getFileName(), repoRoot.relativize(sourceFile), content);
+
+        // Invoke AI Agent
+        String response = agent.generateTestCode(contextPayload);
+        String cleanCode = extractCodeBlock(response);
+
+        if (cleanCode.isBlank()) {
+            System.out.println("⚠️ Model failed to output code syntax for " + sourceFile.getFileName());
+            return;
+        }
+
+        // Determine destination file based on convention mapping
+        Path targetTestFile = determineTestFilePath(repoRoot, sourceFile);
+        
+        // Write file out
+        Files.createDirectories(targetTestFile.getParent());
+        Files.writeString(targetTestFile, cleanCode, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("✅ Generated test saved to: " + repoRoot.relativize(targetTestFile));
+    }
+
+    private static Path determineTestFilePath(Path repoRoot, Path sourceFile) {
+        String filename = sourceFile.getFileName().toString();
+        String relativePathStr = repoRoot.relativize(sourceFile).toString();
+
+        if (filename.endsWith(".java")) {
+            String testFilename = filename.replace(".java", "Test.java");
+            // Maps typical src/main/java/... to src/test/java/...
+            if (relativePathStr.contains("src/main/java")) {
+                String testPathStr = relativePathStr.replace("src/main/java", "src/test/java").replace(filename, testFilename);
+                return repoRoot.resolve(testPathStr);
+            }
+            return sourceFile.getParent().resolve(testFilename);
+        } else if (filename.endsWith(".py")) {
+            return sourceFile.getParent().resolve("test_" + filename);
+        } else if (filename.endsWith(".ts") || filename.endsWith(".js")) {
+            String ext = filename.endsWith(".ts") ? ".ts" : ".js";
+            return sourceFile.getParent().resolve(filename.replace(ext, ".test" + ext));
+        }
+
+        return sourceFile.getParent().resolve("Test_" + filename);
+    }
+
+    private static String extractCodeBlock(String markdown) {
+        Pattern pattern = Pattern.compile("```(?:[a-zA-Z0-9-]+\\s*)?(.*?)```", Pattern.DOTALL);
+        Matcher matcher = pattern.matcher(markdown);
+        if (matcher.find()) {
+            return matcher.group(1).trim();
+        }
+        return markdown.trim(); // fallback if code blocks aren't closed cleanly
+    }
+}
