@@ -1,0 +1,76 @@
+run ollama locally
+
+<!-- LangChain4j Ollama Integration -->
+<dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j-ollama</artifactId>
+    <version>0.31.0</version>
+</dependency>
+
+post installation of ollama
+# Highly recommended for code generation tasks
+ollama run qwen2.5-coder:7b
+
+
+
+// java code to use
+
+package com.agent.testwriter;
+
+import dev.langchain4j.model.ollama.OllamaChatModel; // Updated import
+import dev.langchain4j.service.AiServices;
+
+import java.io.IOException;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class TestAgentApplication {
+
+    private static TestGeneratorAgent agent;
+
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("❌ Error: Please provide the absolute path to your repository root folder.");
+            System.exit(1);
+        }
+
+        Path repoPath = Paths.get(args[0]);
+
+        if (!Files.exists(repoPath) || !Files.isDirectory(repoPath)) {
+            System.out.println("❌ Error: Provided path does not exist or is not a directory.");
+            System.exit(1);
+        }
+
+        // Initialize Local Ollama Model
+        OllamaChatModel model = OllamaChatModel.builder()
+                .baseUrl("http://localhost:11434") // Default local Ollama address
+                .modelName("qwen2.5-coder:7b")     // Must match the model pulled in Step 2
+                .timeout(Duration.ofMinutes(5))    // Local models take longer than cloud APIs
+                .temperature(0.0)                  // Keep it deterministic for code structure
+                .build();
+
+        // Build the AI Agent exactly as before
+        agent = AiServices.builder(TestGeneratorAgent.class)
+                .chatLanguageModel(model)
+                .build();
+
+        System.out.println("🚀 Starting LOCAL Test Generation Agent for: " + repoPath.toAbsolutePath());
+        
+        try {
+            scanAndGenerateTests(repoPath);
+            System.out.println("🎉 Local test generation sweep complete!");
+        } catch (IOException e) {
+            System.err.println("❌ Critical failure: " + e.getMessage());
+        }
+    }
+
+    // ... Keep the remaining scanning, writing, and extraction helper methods exactly the same as the previous response ...
+}
+
+
+
+//how to run
+java -jar target/java-test-agent-1.0-SNAPSHOT.jar /path/to/your/cloned/project
+
