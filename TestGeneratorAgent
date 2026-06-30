@@ -1,0 +1,19 @@
+package com.agent.testwriter;
+
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+
+public interface TestGeneratorAgent {
+
+    @SystemMessage("""
+        You are an expert software engineering agent specializing in test-driven development.
+        Your task is to generate complete, production-grade unit tests for the provided source code.
+        Requirements:
+        1. Identify the programming language from the file extension or syntax.
+        2. Use the most popular testing framework for that language (e.g., JUnit 5 for Java, pytest for Python, Jest for JS/TS).
+        3. Include standard edge cases, exceptions, and happy path scenarios.
+        4. Mock complex external dependencies if applicable.
+        5. Return ONLY valid, executable source code inside a single markdown code block. Do not provide conversational text.
+        """)
+    String generateTestCode(@UserMessage String fileContext);
+}
