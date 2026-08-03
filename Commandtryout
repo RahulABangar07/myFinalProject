@@ -1,3 +1,103 @@
 (Invoke-RestMethod -Uri "http://localhost:8080/actuator/mappings").contexts.application.mappings.dispatcherServlets.dispatcherServlet
 
 
+
+
+///// try below stored procedure 
+
+
+# 1. Configuration
+$baseUri = "http://localhost:8080"
+$mappingsUrl = "$baseUri/actuator/mappings"
+
+# Simulated Auth / Common Headers
+$headers = @{ 
+    "Authorization" = "Bearer YOUR_TEST_TOKEN_HERE" 
+    "Content-Type"  = "application/json"
+}
+
+# Sample dummy body payloads for POST/PUT requests
+$dummyJsonBody = '{"id":1, "name":"test", "status":"active"}'
+
+# 2. Fetch live mappings from Actuator
+try {
+    $response = Invoke-RestMethod -Uri $mappingsUrl -Headers $headers -ErrorAction Stop
+} catch {
+    Write-Error "Failed to connect to Actuator endpoint: $_"
+    return
+}
+
+# 3. Parse endpoints alongside their specific HTTP Methods
+$dispatcherServlets = $response.contexts.application.mappings.dispatcherServlets.dispatcherServlet
+$endpointsToTest = foreach ($mapping in $dispatcherServlets) {
+    $patterns = $mapping.details.requestMappingConditions.patterns
+    $methods  = $mapping.details.requestMappingConditions.methods
+
+    # Loop through patterns if an endpoint maps to multiple paths
+    foreach ($path in $patterns) {
+        # Filter out built-in Actuator and system endpoints
+        if ($path -like "/actuator*" -or $path -eq "/error") { continue }
+
+        # If no specific method is defined in Java, default to testing GET
+        $methodList = if ($methods) { $methods } else { @("GET") }
+
+        foreach ($method in $methodList) {
+            [PSCustomObject]@{
+                Path   = $path
+                Method = $method
+            }
+        }
+    }
+}
+
+# Deduplicate the list to avoid testing identical configurations twice
+$endpointsToTest = $endpointsToTest | Select-Object -Property Path, Method -Unique
+
+# 4. Define target HTTP statuses you want to surface
+$targetStatuses = @(200, 201, 204, 400, 401, 500)
+
+# 5. Execute Scans
+$results = foreach ($api in $endpointsToTest) {
+    # Replace path variables like /api/users/{id} with a dummy value '1'
+    $templatedPath = $api.Path -replace '\{.*?\}', '1' 
+    $fullUrl = $baseUri + $templatedPath
+
+    # Prepare standard web request parameters
+    $requestParams = @{
+        Uri         = $fullUrl
+        Method      = $api.Method
+        Headers     = $headers
+        ErrorAction = "Stop"
+    }
+
+    # Inject dummy body data for state-changing operations
+    if ($api.Method -in @("POST", "PUT")) {
+        $requestParams["Body"] = $dummyJsonBody
+    }
+
+    # Send the test request
+    try {
+        $testReq = Invoke-WebRequest @requestParams
+        $statusCode = $testReq.StatusCode
+    } catch {
+        # Intercept 4xx and 5xx exception responses safely
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        } else {
+            $statusCode = "Network/Connection Error"
+        }
+    }
+
+    # Filter and capture output matching your criteria
+    if ($statusCode -in $targetStatuses) {
+        [PSCustomObject]@{
+            Method     = $api.Method
+            Endpoint   = $api.Path
+            TestedUrl  = $fullUrl
+            StatusCode = $statusCode
+        }
+    }
+}
+
+# 6. Display visual matrix table
+$results | Format-Table -AutoSize
