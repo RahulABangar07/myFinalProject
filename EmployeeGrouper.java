@@ -1,21 +1,67 @@
 import java.util.*;
 
-public class EmployeeGrouper {
+public class PrioritizedEmployeeGrouper {
 
-    public static void divideEmployees(
+    // Configurable tolerance property
+    private static final double TOLERANCE_PERCENT = 5.0;
+
+    // Simple flat POJO representing your input database records
+    public static class EmployeeRecord {
+        private final String employeeNumber;
+        private final String groupId;
+
+        public EmployeeRecord(String employeeNumber, String groupId) {
+            this.employeeNumber = employeeNumber;
+            this.groupId = groupId;
+        }
+
+        public String getEmployeeNumber() { return employeeNumber; }
+        public String getGroupId() { return groupId; }
+    }
+
+    /**
+     * ADAPTER METHOD: Converts a flat list of employee-group records into graph structures
+     * and executes the bounded, prioritized partitioning.
+     */
+    public static void generateInputAndExecute(List<EmployeeRecord> flatRecords, double targetPercent) {
+        Set<String> allEmployees = new HashSet<>();
+        Set<String> allGroups = new HashSet<>();
+        Map<String, List<String>> employeeToGroups = new HashMap<>();
+
+        // Process flat list sequentially to build graph structures
+        for (EmployeeRecord record : flatRecords) {
+            if (record == null) continue;
+            
+            String emp = record.getEmployeeNumber();
+            String grp = record.getGroupId();
+
+            if (emp != null) allEmployees.add(emp);
+            if (grp != null) allGroups.add(grp);
+
+            if (emp != null && grp != null) {
+                employeeToGroups.computeIfAbsent(emp, k -> new ArrayList<>()).add(grp);
+            }
+        }
+
+        // Forward structural data maps to the core traversal logic
+        divideEmployeesWithBridgePriority(employeeToGroups, allEmployees, allGroups, targetPercent);
+    }
+
+    /**
+     * CORE ALGORITHM: Performs the bounded graph traversal with bridge prioritization
+     */
+    public static void divideEmployeesWithBridgePriority(
             Map<String, List<String>> employeeToGroups, 
             Set<String> allEmployees, 
-            Set<String> allGroups) {
+            Set<String> allGroups,
+            double targetPercent) {
 
-        // Edge case: No groups exist in the system
         if (allGroups.isEmpty()) {
             System.out.println("No groups available to partition. All employees assigned to Group 2.");
-            System.out.println("Group 1: []");
-            System.out.println("Group 2: " + allEmployees + "\n");
             return;
         }
 
-        // Step 1: Build inverse mapping (Group -> List of Employees)
+        // Step 1: Map Group -> List of Employees
         Map<String, List<String>> groupToEmployees = new HashMap<>();
         for (String group : allGroups) {
             groupToEmployees.put(group, new ArrayList<>());
@@ -23,8 +69,6 @@ public class EmployeeGrouper {
         for (Map.Entry<String, List<String>> entry : employeeToGroups.entrySet()) {
             String emp = entry.getKey();
             List<String> groups = entry.getValue();
-            
-            // Clean handling for employees with no groups (null or empty lists)
             if (groups != null) {
                 for (String grp : groups) {
                     if (groupToEmployees.containsKey(grp)) {
@@ -34,33 +78,73 @@ public class EmployeeGrouper {
             }
         }
 
-        // Step 2: Pick the first group randomly/sequentially as the seed
+        // Step 2: Seed the execution from the first available group
         String seedGroup = allGroups.iterator().next();
-        System.out.println("Starting recursive search from Seed Group: " + seedGroup);
+        System.out.printf("Starting search from Seed Group: %s | Target: %.1f%% | Tolerance: %.1f%%%n%n", 
+                seedGroup, targetPercent, TOLERANCE_PERCENT);
 
         Set<String> group1Employees = new HashSet<>();
         Set<String> visitedGroups = new HashSet<>();
         Queue<String> groupQueue = new LinkedList<>();
 
-        // Initialize queue with seed group
         groupQueue.add(seedGroup);
         visitedGroups.add(seedGroup);
 
-        // Step 3: Breadth-First Search (BFS) for recursive linking
+        // Step 3: Queue processing with capacity controls and priority routing
         while (!groupQueue.isEmpty()) {
             String currentGroup = groupQueue.poll();
-            List<String> employeesInGroup = groupToEmployees.getOrDefault(currentGroup, Collections.emptyList());
+            List<String> rawGroupPool = groupToEmployees.getOrDefault(currentGroup, Collections.emptyList());
+            
+            int totalGroupSize = rawGroupPool.size();
+            if (totalGroupSize == 0) continue;
 
-            for (String emp : employeesInGroup) {
-                // Try adding employee to Group 1
-                if (group1Employees.add(emp)) {
-                    // If newly discovered, find all groups they tag into
+            // Calculate target limits using percentage and tolerance rules
+            int minAllowed = (int) Math.max(0, Math.floor(((targetPercent - TOLERANCE_PERCENT) / 100.0) * totalGroupSize));
+            int maxAllowed = (int) Math.min(totalGroupSize, Math.ceil(((targetPercent + TOLERANCE_PERCENT) / 100.0) * totalGroupSize));
+            int allowedCapacity = Math.max(minAllowed, Math.min(maxAllowed, (int) Math.round((targetPercent / 100.0) * totalGroupSize)));
+
+            // Separate candidates and track who is already captured in Group 1
+            List<String> bridgeCandidates = new ArrayList<>();
+            List<String> regularCandidates = new ArrayList<>();
+            int alreadyInGroup1Count = 0;
+
+            for (String emp : rawGroupPool) {
+                if (group1Employees.contains(emp)) {
+                    alreadyInGroup1Count++;
+                } else {
                     List<String> linkedGroups = employeeToGroups.getOrDefault(emp, Collections.emptyList());
+                    if (linkedGroups != null && linkedGroups.size() > 1) {
+                        bridgeCandidates.add(emp);
+                    } else {
+                        regularCandidates.add(emp);
+                    }
+                }
+            }
+
+            int quotaRemaining = allowedCapacity - alreadyInGroup1Count;
+
+            if (quotaRemaining > 0) {
+                // Keep selections random within their respective structural tiers
+                Collections.shuffle(bridgeCandidates);
+                Collections.shuffle(regularCandidates);
+
+                List<String> prioritizedSelectionList = new ArrayList<>();
+                prioritizedSelectionList.addAll(bridgeCandidates);
+                prioritizedSelectionList.addAll(regularCandidates);
+
+                int itemsToTake = Math.min(quotaRemaining, prioritizedSelectionList.size());
+
+                for (int i = 0; i < itemsToTake; i++) {
+                    String selectedEmp = prioritizedSelectionList.get(i);
+                    group1Employees.add(selectedEmp);
+
+                    // Track down cross-linked groups from chosen employee
+                    List<String> linkedGroups = employeeToGroups.getOrDefault(selectedEmp, Collections.emptyList());
                     if (linkedGroups != null) {
                         for (String linkedGroup : linkedGroups) {
                             if (!visitedGroups.contains(linkedGroup)) {
                                 visitedGroups.add(linkedGroup);
-                                groupQueue.add(linkedGroup); 
+                                groupQueue.add(linkedGroup);
                             }
                         }
                     }
@@ -68,7 +152,7 @@ public class EmployeeGrouper {
             }
         }
 
-        // Step 4: Remainder fallback (unlinked or group-less employees go to Group 2)
+        // Step 4: Leftovers fall back to Group 2
         Set<String> group2Employees = new HashSet<>();
         for (String emp : allEmployees) {
             if (!group1Employees.contains(emp)) {
@@ -76,39 +160,36 @@ public class EmployeeGrouper {
             }
         }
 
-        // Print final distribution
-        System.out.println("=== FINAL PARTITION ===");
-        System.out.println("Group 1: " + group1Employees);
-        System.out.println("Group 2: " + group2Employees + "\n");
+        // Print final outputs
+        System.out.println("=== FINAL SELECTION OUTPUT ===");
+        System.out.println("Group 1 Size (" + group1Employees.size() + "): " + group1Employees);
+        System.out.println("Group 2 Size (" + group2Employees.size() + "): " + group2Employees);
     }
 
     public static void main(String[] args) {
-        // Master list definition
-        Set<String> allEmployees = new HashSet<>(Arrays.asList(
-            "EmpA", "EmpB", "EmpC", "EmpD", "EmpIsolated", "EmpUniversal"
-        ));
-        Set<String> allGroups = new HashSet<>(Arrays.asList("X", "Y", "Z"));
-
-        // Setup relationship mapping
-        Map<String, List<String>> employeeToGroups = new HashMap<>();
+        // Simulating flat database table rows where an employee appears multiple times if in multiple groups
+        List<EmployeeRecord> flatDatabaseRecords = new ArrayList<>();
         
-        // Regular entries
-        employeeToGroups.put("EmpA", Arrays.asList("X"));
-        employeeToGroups.put("EmpB", Arrays.asList("Y"));
-        employeeToGroups.put("EmpC", Arrays.asList("Z"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp1", "Group_X"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp2", "Group_X"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp4", "Group_X"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp5", "Group_X"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp6", "Group_X"));
+        
+        // Emp3 is the structural bridge linking Group_X and Group_Y
+        flatDatabaseRecords.add(new EmployeeRecord("Emp3", "Group_X"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp3", "Group_Y")); 
 
-        // EDGE CASE 1: Employee connected to absolutely NO groups
-        employeeToGroups.put("EmpIsolated", Collections.emptyList()); 
+        // Emp7 is the structural bridge linking Group_Y and Group_Z
+        flatDatabaseRecords.add(new EmployeeRecord("Emp7", "Group_Y"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp7", "Group_Z"));
+        
+        flatDatabaseRecords.add(new EmployeeRecord("Emp8", "Group_Y"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp9", "Group_Z"));
+        flatDatabaseRecords.add(new EmployeeRecord("Emp10", "Group_Z"));
 
-        // EDGE CASE 2: Employee connected to ALL groups (Acts as a structural bridge)
-        employeeToGroups.put("EmpUniversal", Arrays.asList("X", "Y", "Z")); 
-
-        System.out.println("--- TEST 1: With Universal Bridge ---");
-        divideEmployees(employeeToGroups, allEmployees, allGroups);
-
-        System.out.println("--- TEST 2: Without Universal Bridge (Isolated Removed Connection) ---");
-        // Sever the bridge to demonstrate ordinary network isolation
-        employeeToGroups.put("EmpUniversal", Collections.emptyList()); 
-        divideEmployees(employeeToGroups, allEmployees, allGroups);
+        // Trigger input generation followed by graph partition with a 50% target
+        double inputPercentageParam = 50.0; 
+        generateInputAndExecute(flatDatabaseRecords, inputPercentageParam);
     }
 }
