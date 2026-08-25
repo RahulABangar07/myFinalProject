@@ -1,0 +1,1314 @@
+package com.example.datacopy;
+
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenRequestContext;
+import com.azure.identity.DefaultAzureCredential;
+import com.azure.identity.DefaultAzureCredentialBuilder;
+import com.microsoft.sqlserver.jdbc.SQLServerAccessTokenCallback;
+import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
+import com.microsoft.sqlserver.jdbc.SqlAuthenticationToken;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.JobExecution;
+import org.springframework.batch.core.JobParameters;
+import org.springframework.batch.core.JobParametersBuilder;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.JobLauncher;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.builder.StepBuilder;
+
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.database.JdbcBatchItemWriter;
+import org.springframework.batch.item.database.JdbcPagingItemReader;
+import org.springframework.batch.item.database.Order;
+import org.springframework.batch.item.database.builder.JdbcBatchItemWriterBuilder;
+import org.springframework.batch.item.database.builder.JdbcPagingItemReaderBuilder;
+import org.springframework.batch.item.database.support.PostgresPagingQueryProvider;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import org.springframework.transaction.PlatformTransactionManager;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.sql.DataSource;
+
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+
+import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import java.util.logging.Logger;
+
+
+/**
+ * ============================================================
+ * GREENPLUM -> AZURE SQL DATA COPY SERVICE
+ * ============================================================
+ *
+ * Architecture:
+ *
+ *       REST
+ *        |
+ *        v
+ *   Spring Batch Job
+ *        |
+ *        v
+ *   Partitioned Master Step
+ *        |
+ *        +---- P0 ---- Greenplum -> Azure SQL
+ *        +---- P1 ---- Greenplum -> Azure SQL
+ *        +---- P2 ---- Greenplum -> Azure SQL
+ *        +---- ...
+ *        +---- P15 --- Greenplum -> Azure SQL
+ *
+ * Spring Batch metadata:
+ *
+ *       Azure PostgreSQL
+ *             ^
+ *             |
+ *       JobRepository
+ *
+ *
+ * Authentication:
+ *
+ * Greenplum:
+ *     username/password
+ *
+ * Azure SQL:
+ *     AKS Workload Identity
+ *     DefaultAzureCredential
+ *     SQLServerAccessTokenCallback
+ *
+ * Azure PostgreSQL:
+ *     AKS Workload Identity
+ *     DefaultAzureCredential
+ *     access token as PostgreSQL password
+ *
+ *
+ * IMPORTANT:
+ *
+ * The reader is @StepScope.
+ *
+ * Therefore each partition receives its own reader instance.
+ * No JdbcPagingItemReader is shared between worker threads.
+ *
+ * This is important because JDBC paging readers maintain state.
+ */
+@SpringBootApplication(
+        exclude = {
+                DataSourceAutoConfiguration.class
+        }
+)
+public class DataCopyApplication {
+
+    public static void main(String[] args) {
+
+        SpringApplication.run(
+                DataCopyApplication.class,
+                args
+        );
+    }
+
+
+    // =========================================================
+    // DOMAIN
+    // =========================================================
+
+    public record Customer(
+            long id,
+            String name,
+            BigDecimal amount,
+            OffsetDateTime updatedAt
+    ) {
+    }
+
+
+    // =========================================================
+    // ROW MAPPER
+    // =========================================================
+
+    public static class CustomerRowMapper
+            implements org.springframework.jdbc.core.RowMapper<Customer> {
+
+        @Override
+        public Customer mapRow(
+                ResultSet rs,
+                int rowNum) throws SQLException {
+
+            Timestamp timestamp =
+                    rs.getTimestamp("updated_at");
+
+            OffsetDateTime updatedAt = null;
+
+            if (timestamp != null) {
+
+                updatedAt =
+                        timestamp
+                                .toInstant()
+                                .atOffset(ZoneOffset.UTC);
+            }
+
+            return new Customer(
+                    rs.getLong("id"),
+                    rs.getString("name"),
+                    rs.getBigDecimal("amount"),
+                    updatedAt
+            );
+        }
+    }
+
+
+    // =========================================================
+    // AZURE CREDENTIAL
+    // =========================================================
+
+    @Configuration
+    public static class AzureCredentialConfiguration {
+
+        @Bean
+        public DefaultAzureCredential azureCredential() {
+
+            /*
+             * DefaultAzureCredential supports Workload Identity
+             * when running in AKS.
+             *
+             * It can also use developer credentials locally.
+             *
+             * No client secret or refresh token is stored here.
+             */
+            return new DefaultAzureCredentialBuilder()
+                    .build();
+        }
+    }
+
+
+    // =========================================================
+    // AZURE SQL ACCESS TOKEN CALLBACK
+    // =========================================================
+
+    public static class AzureSqlTokenCallback
+            implements SQLServerAccessTokenCallback {
+
+        private static final String SQL_SCOPE =
+                "https://database.windows.net/.default";
+
+        private final DefaultAzureCredential credential;
+
+        public AzureSqlTokenCallback(
+                DefaultAzureCredential credential) {
+
+            this.credential = credential;
+        }
+
+        @Override
+        public SqlAuthenticationToken getAccessToken(
+                String spn,
+                String stsUrl) {
+
+            try {
+
+                TokenRequestContext context =
+                        new TokenRequestContext()
+                                .addScopes(SQL_SCOPE);
+
+                AccessToken token =
+                        credential
+                                .getToken(context)
+                                .block(
+                                        Duration.ofSeconds(30)
+                                );
+
+                if (token == null) {
+
+                    throw new IllegalStateException(
+                            "Azure SQL access token is null"
+                    );
+                }
+
+                return new SqlAuthenticationToken(
+                        token.getToken(),
+                        token.getExpiresAt()
+                                .toEpochSecond()
+                                * 1000L
+                );
+
+            } catch (Exception e) {
+
+                throw new IllegalStateException(
+                        "Unable to obtain Azure SQL access token",
+                        e
+                );
+            }
+        }
+    }
+
+
+    // =========================================================
+    // AZURE POSTGRESQL TOKEN DATA SOURCE
+    // =========================================================
+
+    /**
+     * Azure PostgreSQL uses the Entra access token as the
+     * PostgreSQL password when opening a physical connection.
+     *
+     * A token is acquired when Hikari creates a new physical
+     * connection.
+     *
+     * Hikari is also configured with maxLifetime so connections
+     * don't remain alive indefinitely.
+     */
+    public static class AzurePostgresDataSource
+            implements DataSource {
+
+        private static final String POSTGRES_SCOPE =
+                "https://ossrdbms-aad.database.windows.net/.default";
+
+        private final String jdbcUrl;
+        private final String username;
+        private final DefaultAzureCredential credential;
+
+        public AzurePostgresDataSource(
+                String jdbcUrl,
+                String username,
+                DefaultAzureCredential credential) {
+
+            this.jdbcUrl = jdbcUrl;
+            this.username = username;
+            this.credential = credential;
+        }
+
+        private Connection openConnection()
+                throws SQLException {
+
+            try {
+
+                AccessToken token =
+                        credential
+                                .getToken(
+                                        new TokenRequestContext()
+                                                .addScopes(
+                                                        POSTGRES_SCOPE
+                                                )
+                                )
+                                .block(
+                                        Duration.ofSeconds(30)
+                                );
+
+                if (token == null) {
+
+                    throw new SQLException(
+                            "Azure PostgreSQL token is null"
+                    );
+                }
+
+                org.postgresql.ds.PGSimpleDataSource pg =
+                        new org.postgresql.ds.PGSimpleDataSource();
+
+                pg.setUrl(jdbcUrl);
+
+                pg.setUser(username);
+
+                /*
+                 * Azure PostgreSQL Entra authentication:
+                 * access token is used as password.
+                 */
+                pg.setPassword(
+                        token.getToken()
+                );
+
+                return pg.getConnection();
+
+            } catch (SQLException e) {
+
+                throw e;
+
+            } catch (Exception e) {
+
+                throw new SQLException(
+                        "Unable to obtain Azure PostgreSQL token",
+                        e
+                );
+            }
+        }
+
+        @Override
+        public Connection getConnection()
+                throws SQLException {
+
+            return openConnection();
+        }
+
+        @Override
+        public Connection getConnection(
+                String username,
+                String password)
+                throws SQLException {
+
+            return openConnection();
+        }
+
+        @Override
+        public java.io.PrintWriter getLogWriter() {
+
+            return null;
+        }
+
+        @Override
+        public void setLogWriter(
+                java.io.PrintWriter out) {
+        }
+
+        @Override
+        public void setLoginTimeout(int seconds) {
+        }
+
+        @Override
+        public int getLoginTimeout() {
+
+            return 30;
+        }
+
+        @Override
+        public Logger getParentLogger()
+                throws java.sql.SQLFeatureNotSupportedException {
+
+            throw new java.sql.SQLFeatureNotSupportedException();
+        }
+
+        @Override
+        public <T> T unwrap(Class<T> iface)
+                throws SQLException {
+
+            if (iface.isAssignableFrom(getClass())) {
+
+                return iface.cast(this);
+            }
+
+            throw new SQLException(
+                    "Not a wrapper for " + iface
+            );
+        }
+
+        @Override
+        public boolean isWrapperFor(Class<?> iface) {
+
+            return iface.isAssignableFrom(getClass());
+        }
+    }
+
+
+    // =========================================================
+    // DATA SOURCE CONFIGURATION
+    // =========================================================
+
+    @Configuration
+    public static class DataSourceConfiguration {
+
+
+        // -----------------------------------------------------
+        // GREENPLUM
+        // -----------------------------------------------------
+
+        @Bean(name = "greenplumDataSource")
+        public DataSource greenplumDataSource(
+
+                @Value("${app.greenplum.jdbc-url}")
+                String jdbcUrl,
+
+                @Value("${app.greenplum.username}")
+                String username,
+
+                @Value("${app.greenplum.password}")
+                String password,
+
+                @Value("${app.greenplum.pool-size:16}")
+                int poolSize) {
+
+            HikariConfig config =
+                    new HikariConfig();
+
+            config.setJdbcUrl(jdbcUrl);
+            config.setUsername(username);
+            config.setPassword(password);
+
+            config.setMaximumPoolSize(poolSize);
+
+            config.setMinimumIdle(
+                    Math.min(2, poolSize)
+            );
+
+            config.setPoolName(
+                    "greenplum-pool"
+            );
+
+            config.setConnectionTimeout(30_000);
+            config.setValidationTimeout(10_000);
+
+            /*
+             * Greenplum source connections can be reused.
+             */
+            config.setMaxLifetime(
+                    30 * 60 * 1000L
+            );
+
+            return new HikariDataSource(config);
+        }
+
+
+        @Bean
+        public JdbcTemplate greenplumJdbcTemplate(
+                @Qualifier("greenplumDataSource")
+                DataSource dataSource) {
+
+            JdbcTemplate jdbc =
+                    new JdbcTemplate(dataSource);
+
+            jdbc.setFetchSize(2000);
+
+            return jdbc;
+        }
+
+
+        // -----------------------------------------------------
+        // AZURE SQL
+        // -----------------------------------------------------
+
+        @Bean(name = "targetDataSource")
+        public DataSource targetDataSource(
+
+                @Value("${app.azure-sql.server}")
+                String server,
+
+                @Value("${app.azure-sql.database}")
+                String database,
+
+                @Value("${app.azure-sql.pool-size:16}")
+                int poolSize,
+
+                DefaultAzureCredential credential) {
+
+            SQLServerDataSource sql =
+                    new SQLServerDataSource();
+
+            sql.setServerName(server);
+
+            sql.setDatabaseName(database);
+
+            sql.setEncrypt(true);
+
+            sql.setTrustServerCertificate(false);
+
+            /*
+             * DO NOT use:
+             *
+             * sql.setAccessToken(...)
+             *
+             * because that would put a single token into
+             * the datasource.
+             *
+             * Instead use a callback.
+             *
+             * The JDBC driver can request a new token when
+             * it needs one.
+             */
+            sql.setAccessTokenCallback(
+                    new AzureSqlTokenCallback(
+                            credential
+                    )
+            );
+
+            HikariConfig config =
+                    new HikariConfig();
+
+            config.setDataSource(sql);
+
+            config.setMaximumPoolSize(poolSize);
+
+            config.setMinimumIdle(
+                    Math.min(2, poolSize)
+            );
+
+            config.setPoolName(
+                    "azure-sql-pool"
+            );
+
+            config.setConnectionTimeout(30_000);
+
+            config.setValidationTimeout(10_000);
+
+            /*
+             * Avoid keeping physical connections forever.
+             */
+            config.setMaxLifetime(
+                    20 * 60 * 1000L
+            );
+
+            config.setKeepaliveTime(
+                    2 * 60 * 1000L
+            );
+
+            return new HikariDataSource(config);
+        }
+
+
+        @Bean(name = "targetTransactionManager")
+        public PlatformTransactionManager
+        targetTransactionManager(
+
+                @Qualifier("targetDataSource")
+                DataSource dataSource) {
+
+            return new DataSourceTransactionManager(
+                    dataSource
+            );
+        }
+
+
+        // -----------------------------------------------------
+        // AZURE POSTGRESQL
+        // SPRING BATCH JOB REPOSITORY
+        // -----------------------------------------------------
+
+        @Bean(name = "batchDataSource")
+        @Primary
+        public DataSource batchDataSource(
+
+                @Value("${app.batch-postgres.jdbc-url}")
+                String jdbcUrl,
+
+                @Value("${app.batch-postgres.username}")
+                String username,
+
+                @Value("${app.batch-postgres.pool-size:5}")
+                int poolSize,
+
+                DefaultAzureCredential credential) {
+
+            DataSource tokenDataSource =
+                    new AzurePostgresDataSource(
+                            jdbcUrl,
+                            username,
+                            credential
+                    );
+
+            HikariConfig config =
+                    new HikariConfig();
+
+            config.setDataSource(
+                    tokenDataSource
+            );
+
+            config.setMaximumPoolSize(poolSize);
+
+            config.setMinimumIdle(1);
+
+            config.setPoolName(
+                    "batch-postgres-pool"
+            );
+
+            config.setConnectionTimeout(30_000);
+
+            config.setValidationTimeout(10_000);
+
+            config.setMaxLifetime(
+                    20 * 60 * 1000L
+            );
+
+            config.setKeepaliveTime(
+                    2 * 60 * 1000L
+            );
+
+            return new HikariDataSource(config);
+        }
+
+
+        @Bean(name = "batchTransactionManager")
+        public PlatformTransactionManager
+        batchTransactionManager(
+
+                @Qualifier("batchDataSource")
+                DataSource dataSource) {
+
+            return new DataSourceTransactionManager(
+                    dataSource
+            );
+        }
+    }
+
+
+    // =========================================================
+    // SPRING BATCH CONFIGURATION
+    // =========================================================
+
+    @Configuration
+    @EnableBatchProcessing(
+            dataSourceRef = "batchDataSource",
+            transactionManagerRef =
+                    "batchTransactionManager",
+            isolationLevelForCreate =
+                    "ISOLATION_READ_COMMITTED"
+    )
+    public static class BatchInfrastructureConfiguration {
+
+
+        /**
+         * REST request starts the job asynchronously.
+         */
+        @Bean(name = "jobLauncher")
+        public JobLauncher jobLauncher(
+                JobRepository jobRepository)
+                throws Exception {
+
+            org.springframework.batch.core.launch.support.TaskExecutorJobLauncher
+                    launcher =
+                    new org.springframework.batch.core.launch.support.TaskExecutorJobLauncher();
+
+            launcher.setJobRepository(
+                    jobRepository
+            );
+
+            ThreadPoolTaskExecutor executor =
+                    new ThreadPoolTaskExecutor();
+
+            executor.setCorePoolSize(2);
+
+            executor.setMaxPoolSize(2);
+
+            executor.setQueueCapacity(10);
+
+            executor.setThreadNamePrefix(
+                    "job-launcher-"
+            );
+
+            executor.initialize();
+
+            launcher.setTaskExecutor(
+                    executor
+            );
+
+            launcher.afterPropertiesSet();
+
+            return launcher;
+        }
+    }
+
+
+    // =========================================================
+    // PARTITIONER
+    // =========================================================
+
+    @Configuration
+    public static class PartitionConfiguration {
+
+
+        @Bean
+        public Partitioner customerPartitioner(
+
+                JdbcTemplate greenplumJdbcTemplate,
+
+                @Value("${app.batch.partition-count:16}")
+                int partitionCount) {
+
+            return gridSize -> {
+
+                /*
+                 * Grid size from Spring Batch is allowed to
+                 * influence partitioning.
+                 */
+                int actualPartitions =
+                        Math.max(
+                                1,
+                                partitionCount
+                        );
+
+                Map<String, ExecutionContext>
+                        partitions =
+                        new LinkedHashMap<>();
+
+                Long minId =
+                        greenplumJdbcTemplate.queryForObject(
+                                """
+                                SELECT MIN(id)
+                                FROM public.customer
+                                """,
+                                Long.class
+                        );
+
+                Long maxId =
+                        greenplumJdbcTemplate.queryForObject(
+                                """
+                                SELECT MAX(id)
+                                FROM public.customer
+                                """,
+                                Long.class
+                        );
+
+                if (minId == null ||
+                        maxId == null) {
+
+                    return partitions;
+                }
+
+                long range =
+                        maxId - minId + 1;
+
+                long partitionSize =
+                        (long) Math.ceil(
+                                (double) range
+                                        / actualPartitions
+                        );
+
+                long start = minId;
+
+                int number = 0;
+
+                while (start <= maxId) {
+
+                    long endExclusive =
+                            Math.min(
+                                    start + partitionSize,
+                                    maxId + 1
+                            );
+
+                    ExecutionContext context =
+                            new ExecutionContext();
+
+                    context.putLong(
+                            "minId",
+                            start
+                    );
+
+                    context.putLong(
+                            "maxId",
+                            endExclusive
+                    );
+
+                    context.putInt(
+                            "partitionNumber",
+                            number
+                    );
+
+                    partitions.put(
+                            "customer-partition-" + number,
+                            context
+                    );
+
+                    start = endExclusive;
+
+                    number++;
+                }
+
+                return partitions;
+            };
+        }
+    }
+
+
+    // =========================================================
+    // BATCH JOB
+    // =========================================================
+
+    @Configuration
+    public static class CustomerCopyJobConfiguration {
+
+
+        // -----------------------------------------------------
+        // PARTITION THREAD POOL
+        // -----------------------------------------------------
+
+        @Bean(name = "partitionTaskExecutor")
+        public TaskExecutor partitionTaskExecutor(
+
+                @Value("${app.batch.partition-count:16}")
+                int partitionCount) {
+
+            ThreadPoolTaskExecutor executor =
+                    new ThreadPoolTaskExecutor();
+
+            executor.setCorePoolSize(
+                    partitionCount
+            );
+
+            executor.setMaxPoolSize(
+                    partitionCount
+            );
+
+            executor.setQueueCapacity(0);
+
+            executor.setThreadNamePrefix(
+                    "copy-partition-"
+            );
+
+            executor.setWaitForTasksToCompleteOnShutdown(
+                    true
+            );
+
+            executor.setAwaitTerminationSeconds(
+                    60
+            );
+
+            executor.initialize();
+
+            return executor;
+        }
+
+
+        // -----------------------------------------------------
+        // QUERY PROVIDER
+        // -----------------------------------------------------
+
+        @Bean
+        public PostgresPagingQueryProvider
+        customerQueryProvider() {
+
+            PostgresPagingQueryProvider provider =
+                    new PostgresPagingQueryProvider();
+
+            provider.setSelectClause(
+                    """
+                    SELECT
+                        id,
+                        name,
+                        amount,
+                        updated_at
+                    """
+            );
+
+            provider.setFromClause(
+                    """
+                    FROM public.customer
+                    """
+            );
+
+            provider.setWhereClause(
+                    """
+                    WHERE id >= :minId
+                      AND id < :maxId
+                    """
+            );
+
+            Map<String, Order> sortKeys =
+                    new LinkedHashMap<>();
+
+            /*
+             * MUST be unique.
+             */
+            sortKeys.put(
+                    "id",
+                    Order.ASCENDING
+            );
+
+            provider.setSortKeys(
+                    sortKeys
+            );
+
+            return provider;
+        }
+
+
+        // -----------------------------------------------------
+        // READER
+        // -----------------------------------------------------
+
+        @Bean
+        @org.springframework.batch.core.configuration.annotation.StepScope
+        public JdbcPagingItemReader<Customer>
+        customerReader(
+
+                @Qualifier("greenplumDataSource")
+                DataSource greenplumDataSource,
+
+                PostgresPagingQueryProvider
+                        customerQueryProvider,
+
+                @Value(
+                    "#{stepExecutionContext['minId']}"
+                )
+                Long minId,
+
+                @Value(
+                    "#{stepExecutionContext['maxId']}"
+                )
+                Long maxId,
+
+                @Value(
+                    "${app.batch.page-size:2000}"
+                )
+                int pageSize) {
+
+            Map<String, Object> parameters =
+                    new HashMap<>();
+
+            parameters.put(
+                    "minId",
+                    minId
+            );
+
+            parameters.put(
+                    "maxId",
+                    maxId
+            );
+
+            return new JdbcPagingItemReaderBuilder<Customer>()
+                    .name(
+                            "customerReader"
+                    )
+                    .dataSource(
+                            greenplumDataSource
+                    )
+                    .queryProvider(
+                            customerQueryProvider
+                    )
+                    .parameterValues(
+                            parameters
+                    )
+                    .pageSize(
+                            pageSize
+                    )
+                    .fetchSize(
+                            pageSize
+                    )
+                    .rowMapper(
+                            new CustomerRowMapper()
+                    )
+                    .saveState(true)
+                    .build();
+        }
+
+
+        // -----------------------------------------------------
+        // WRITER
+        // -----------------------------------------------------
+
+        @Bean
+        public JdbcBatchItemWriter<Customer>
+        customerWriter(
+
+                @Qualifier("targetDataSource")
+                DataSource targetDataSource) {
+
+            /*
+             * MERGE provides idempotency.
+             *
+             * This is important because:
+             *
+             * SQL Server commit
+             *       |
+             *       X
+             * pod crashes
+             *       |
+             *       v
+             * Spring Batch may replay chunk
+             *
+             * MERGE means replay doesn't create duplicate PKs.
+             */
+            String sql =
+                    """
+                    MERGE dbo.customer WITH (HOLDLOCK) AS target
+
+                    USING
+                    (
+                        VALUES
+                        (
+                            :id,
+                            :name,
+                            :amount,
+                            :updatedAt
+                        )
+                    )
+                    AS source
+                    (
+                        id,
+                        name,
+                        amount,
+                        updated_at
+                    )
+
+                    ON target.id = source.id
+
+                    WHEN MATCHED THEN
+
+                        UPDATE SET
+                            target.name =
+                                source.name,
+
+                            target.amount =
+                                source.amount,
+
+                            target.updated_at =
+                                source.updated_at
+
+                    WHEN NOT MATCHED THEN
+
+                        INSERT
+                        (
+                            id,
+                            name,
+                            amount,
+                            updated_at
+                        )
+
+                        VALUES
+                        (
+                            source.id,
+                            source.name,
+                            source.amount,
+                            source.updated_at
+                        );
+                    """;
+
+            return new JdbcBatchItemWriterBuilder<Customer>()
+                    .dataSource(
+                            targetDataSource
+                    )
+                    .sql(sql)
+                    .beanMapped()
+                    .assertUpdates(false)
+                    .build();
+        }
+
+
+        // -----------------------------------------------------
+        // WORKER STEP
+        // -----------------------------------------------------
+
+        @Bean
+        public Step customerWorkerStep(
+
+                JobRepository jobRepository,
+
+                @Qualifier(
+                        "targetTransactionManager"
+                )
+                PlatformTransactionManager
+                        targetTransactionManager,
+
+                JdbcPagingItemReader<Customer>
+                        customerReader,
+
+                JdbcBatchItemWriter<Customer>
+                        customerWriter,
+
+                @Value(
+                        "${app.batch.chunk-size:2000}"
+                )
+                int chunkSize) {
+
+            return new StepBuilder(
+                    "customerWorkerStep",
+                    jobRepository
+            )
+
+                    .<Customer, Customer>chunk(
+                            chunkSize,
+                            targetTransactionManager
+                    )
+
+                    .reader(
+                            customerReader
+                    )
+
+                    .writer(
+                            customerWriter
+                    )
+
+                    .build();
+        }
+
+
+        // -----------------------------------------------------
+        // MASTER PARTITION STEP
+        // -----------------------------------------------------
+
+        @Bean
+        public Step customerPartitionStep(
+
+                JobRepository jobRepository,
+
+                Step customerWorkerStep,
+
+                Partitioner customerPartitioner,
+
+                @Qualifier(
+                        "partitionTaskExecutor"
+                )
+                TaskExecutor partitionTaskExecutor,
+
+                @Value(
+                        "${app.batch.partition-count:16}"
+                )
+                int partitionCount) {
+
+            return new StepBuilder(
+                    "customerPartitionStep",
+                    jobRepository
+            )
+
+                    .partitioner(
+                            "customerWorkerStep",
+                            customerPartitioner
+                    )
+
+                    .step(
+                            customerWorkerStep
+                    )
+
+                    .gridSize(
+                            partitionCount
+                    )
+
+                    .taskExecutor(
+                            partitionTaskExecutor
+                    )
+
+                    .build();
+        }
+
+
+        // -----------------------------------------------------
+        // JOB
+        // -----------------------------------------------------
+
+        @Bean
+        public Job customerCopyJob(
+
+                JobRepository jobRepository,
+
+                Step customerPartitionStep) {
+
+            return new JobBuilder(
+                    "customerCopyJob",
+                    jobRepository
+            )
+
+                    .incrementer(
+                            new RunIdIncrementer()
+                    )
+
+                    .start(
+                            customerPartitionStep
+                    )
+
+                    .build();
+        }
+    }
+
+
+    // =========================================================
+    // REST API
+    // =========================================================
+
+    @RestController
+    @RequestMapping("/api/v1")
+    public static class JobController {
+
+
+        private final JobLauncher jobLauncher;
+
+        private final Job customerCopyJob;
+
+
+        public JobController(
+                JobLauncher jobLauncher,
+                Job customerCopyJob) {
+
+            this.jobLauncher =
+                    jobLauncher;
+
+            this.customerCopyJob =
+                    customerCopyJob;
+        }
+
+
+        /**
+         * Start copy.
+         *
+         * POST:
+         *
+         * /api/v1/jobs/customer-copy
+         */
+        @PostMapping(
+                "/jobs/customer-copy"
+        )
+        public Map<String, Object> startCopy()
+                throws Exception {
+
+            String requestId =
+                    java.util.UUID
+                            .randomUUID()
+                            .toString();
+
+            JobParameters parameters =
+                    new JobParametersBuilder()
+
+                            .addString(
+                                    "requestId",
+                                    requestId
+                            )
+
+                            .addLong(
+                                    "startedAt",
+                                    System.currentTimeMillis()
+                            )
+
+                            .toJobParameters();
+
+            JobExecution execution =
+                    jobLauncher.run(
+                            customerCopyJob,
+                            parameters
+                    );
+
+            return Map.of(
+                    "jobExecutionId",
+                    execution.getId(),
+
+                    "jobInstanceId",
+                    execution
+                            .getJobInstance()
+                            .getInstanceId(),
+
+                    "requestId",
+                    requestId,
+
+                    "status",
+                    execution
+                            .getStatus()
+                            .toString()
+            );
+        }
+    }
+}
