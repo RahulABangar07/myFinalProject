@@ -1,0 +1,157 @@
+-- =================================================================================
+-- 1. DEFINE INPUTS (Accepts any variable filtersql containing WHERE and/or HAVING)
+-- =================================================================================
+DECLARE @FilterSQL NVARCHAR(MAX) = N'(Region = ''US'' AND (StatusCode = ''Active'' OR AssetClass = ''Equity'')) HAVING SUM(market_value) > 10000 OR percent_of_market_value > 0.60';
+
+-- Variables to extract and store separated conditions natively
+DECLARE @BaseWhereSQL NVARCHAR(MAX) = @FilterSQL;
+DECLARE @HavingSQL NVARCHAR(MAX) = N'';
+
+-- Split HAVING clause dynamically if explicitly passed inside the input string
+DECLARE @HavingIdx INT = CHARINDEX('HAVING', @FilterSQL);
+IF @HavingIdx > 0
+BEGIN
+    SET @BaseWhereSQL = SUBSTRING(@FilterSQL, 1, @HavingIdx - 1);
+    SET @HavingSQL = SUBSTRING(@FilterSQL, @HavingIdx, LEN(@FilterSQL) - @HavingIdx + 1);
+END
+
+-- Variables for final injected text components across the execution boundaries
+DECLARE @WhereDemo NVARCHAR(MAX), @WhereClients NVARCHAR(MAX), @WhereMap NVARCHAR(MAX), @WhereInsight NVARCHAR(MAX), @WherePositions NVARCHAR(MAX);
+
+-- =================================================================================
+-- 2. METADATA PARSING ENGINE (Saves tree structures, swaps out missing logic)
+-- =================================================================================
+DECLARE @SqlBlock NVARCHAR(MAX) = N'
+CREATE OR ALTER PROCEDURE #CleanseFilter
+    @TableName NVARCHAR(128),
+    @Alias NVARCHAR(10),
+    @RawFilter NVARCHAR(MAX),
+    @CleanedFilter NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET @CleanedFilter = TRIM(@RawFilter);
+    IF ISNULL(@CleanedFilter, '''') = '''' RETURN;
+    
+    DECLARE @Columns TABLE (ColumnName NVARCHAR(128), IsPresent BIT);
+    
+    -- Gather all distinct column candidates from the schema universe
+    INSERT INTO @Columns (ColumnName, IsPresent)
+    SELECT DISTINCT name, 0
+    FROM sys.columns 
+    WHERE object_id IN (
+        SELECT object_id FROM sys.tables 
+        WHERE name IN (''bv_client_demo'', ''bv_clients'', ''bv_account_hh_map'', ''bv_party_insight'', ''bv_position_details'')
+    );
+
+    -- Flag columns matching the currently targeted table mapping context
+    UPDATE c
+    SET IsPresent = 1
+    FROM @Columns c
+    INNER JOIN sys.columns sc ON sc.name = c.ColumnName
+    INNER JOIN sys.tables st ON st.object_id = sc.object_id
+    WHERE st.name = @TableName;
+
+    DECLARE @ColName NVARCHAR(128), @Present BIT;
+    DECLARE ColCursor CURSOR LOCAL FAST_FORWARD FOR SELECT ColumnName, IsPresent FROM @Columns;
+    
+    OPEN ColCursor;
+    FETCH NEXT FROM ColCursor INTO @ColName, @Present;
+    
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @CleanedFilter LIKE ''%'' + @ColName + ''%''
+        BEGIN
+            IF @Present = 1
+            BEGIN
+                -- Prefix matching target table column attributes
+                SET @CleanedFilter = REPLACE(@CleanedFilter, @ColName, @Alias + ''.'' + @ColName);
+            END
+            ELSE
+            BEGIN
+                -- Dynamically neutralize missing values based on logic path context
+                IF @CleanedFilter LIKE ''%AND%'' + @ColName + ''%'' OR @CleanedFilter LIKE ''%'' + @ColName + ''%AND%''
+                BEGIN
+                    SET @CleanedFilter = REPLACE(@CleanedFilter, @ColName, ''1=1 --'' + @ColName); 
+                END
+                ELSE
+                BEGIN
+                    SET @CleanedFilter = REPLACE(@CleanedFilter, @ColName, ''1=0 --'' + @ColName);
+                END
+            END
+        END
+        FETCH NEXT FROM ColCursor INTO @ColName, @Present;
+    END
+    
+    CLOSE ColCursor;
+    DEALLOCATE ColCursor;
+    
+    -- Format and frame safe dynamic execution snippet blocks
+    SET @CleanedFilter = N'' AND ('' + @CleanedFilter + N'')'';
+END;';
+
+EXEC sp_executesql @SqlBlock;
+
+-- =================================================================================
+-- 3. RESOLVE INDIVIDUAL WHERE CLAUSE CONTEXTS
+-- =================================================================================
+EXEC #CleanseFilter 'bv_client_demo', 'cd', @BaseWhereSQL, @WhereDemo OUTPUT;
+EXEC #CleanseFilter 'bv_clients', 'c', @BaseWhereSQL, @WhereClients OUTPUT;
+EXEC #CleanseFilter 'bv_account_hh_map', 'am', @BaseWhereSQL, @WhereMap OUTPUT;
+EXEC #CleanseFilter 'bv_party_insight', 'pi', @BaseWhereSQL, @WhereInsight OUTPUT;
+EXEC #CleanseFilter 'bv_position_details', 'p', @BaseWhereSQL, @WherePositions OUTPUT;
+
+-- =================================================================================
+-- 4. RESOLVE THE AGGREGATED HAVING CONTEXT FOR THE POSITION TABLE
+-- =================================================================================
+IF ISNULL(@HavingSQL, '') <> ''
+BEGIN
+    -- Apply strict position aliases directly to column expressions inside the HAVING clause
+    SET @HavingSQL = REPLACE(@HavingSQL, 'market_value', 'p.market_value');
+    SET @HavingSQL = REPLACE(@HavingSQL, 'percent_of_market_value', 'p.percent_of_market_value');
+    SET @HavingSQL = REPLACE(@HavingSQL, 'uan', 'p.uan');
+END
+
+-- =================================================================================
+-- 5. ASSEMBLE COMPILATION STRING AND EXECUTE HIGH-PERFORMANCE SET OPERATIONS
+-- =================================================================================
+DECLARE @FinalSQL NVARCHAR(MAX) = N'
+WITH FilteredDemographics AS (
+    SELECT client_id, hhid, employee_count
+    FROM bv_client_demo cd
+    WHERE 1=1' + ISNULL(@WhereDemo, '') + N'
+),
+FilteredPositions AS (
+    -- Performs aggregations and applies specific WHERE and HAVING criteria to the positions table
+    SELECT 
+        p.uan,
+        SUM(p.market_value) AS total_uan_market_value
+    FROM bv_position_details p
+    WHERE 1=1' + ISNULL(@WherePositions, '') + N'
+    GROUP BY p.uan
+    ' + ISNULL(@HavingSQL, '') + N'
+),
+HouseholdMatches AS (
+    -- Maps back to parent identities using multi-way joins across filtered subsets
+    SELECT DISTINCT
+        c.hhid,
+        p.uan,
+        p.total_uan_market_value AS market_value,
+        cd.employee_count
+    FROM FilteredDemographics cd
+    INNER JOIN bv_clients c ON cd.client_id = c.client_id' + ISNULL(@WhereClients, '') + N'
+    INNER JOIN bv_account_hh_map am ON c.hhid = am.hhid AND c.client_id = am.client_id' + ISNULL(@WhereMap, '') + N'
+    INNER JOIN FilteredPositions p ON am.uan = p.uan
+    INNER JOIN bv_party_insight pi ON c.hhid = pi.hhid' + ISNULL(@WhereInsight, '') + N'
+)
+-- Aggregate ultimate values uniquely without double-counting matching lines
+SELECT 
+    COUNT(DISTINCT hhid) AS total_unique_households,
+    SUM(market_value) AS total_market_value, 
+    COUNT(DISTINCT employee_count) AS total_unique_employee_count 
+FROM HouseholdMatches;';
+
+-- Execute the completely processed SQL query dynamically
+EXEC sp_executesql @FinalSQL;
+
+-- Clean up the temporary session system stored procedure object safely
+DROP PROCEDURE IF EXISTS #CleanseFilter;
