@@ -1,123 +1,295 @@
-import net.sf.jsqlparser.JSQLParserException;
+import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.Parenthesis;
+import net.sf.jsqlparser.expression.operators.conditional.AndExpression;
+import net.sf.jsqlparser.expression.operators.conditional.OrExpression;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
-import net.sf.jsqlparser.expression.*;
-import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.statement.select.SelectBody;
+import net.sf.jsqlparser.statement.select.SetOperationList;
+import net.sf.jsqlparser.util.TablesNamesFinder;
+
+
+/*
+<dependency>
+    <groupId>com.github.jsqlparser</groupId>
+    <artifactId>jsqlparser</artifactId>
+    <version>5.1</version>
+</dependency>
+
+*/
+import java.util.*;
+import java.util.stream.Collectors;
 
 public class SqlFilterSplitter {
 
-    public static void main(String[] args) {
-        // Sample complex filter SQL input
-        String filterSql = "SELECT * FROM my_table WHERE insighttype = 'Trend' " +
-                "AND p.status = 'ACTIVE' " +
-                "OR (pa.salary > 5000 AND age > 30)";
+    private static final String TRUE_CONDITION = "1 = 1";
+    private static final String FALSE_CONDITION = "1 = 0";
 
-        System.out.println("--- Original SQL ---");
-        System.out.println(filterSql + "\n");
+    public static class SplitSql {
+        public final String insightTypeFilterSql;
+        public final String positionFilterSql;
+        public final String aggregatePositionFilterSql;
+        public final String demographicFilterSql;
 
-        try {
-            splitSql(filterSql);
-        } catch (JSQLParserException e) {
-            System.err.println("Failed to parse SQL: " + e.getMessage());
+        public SplitSql(
+                String insightTypeFilterSql,
+                String positionFilterSql,
+                String aggregatePositionFilterSql,
+                String demographicFilterSql) {
+            this.insightTypeFilterSql = insightTypeFilterSql;
+            this.positionFilterSql = positionFilterSql;
+            this.aggregatePositionFilterSql = aggregatePositionFilterSql;
+            this.demographicFilterSql = demographicFilterSql;
         }
-    }
-
-    public static void splitSql(String filterSql) throws JSQLParserException {
-        // Parse the master query clones for independent modification
-        Select selectInsight = (Select) CCJSqlParserUtil.parse(filterSql);
-        Select selectPosition = (Select) CCJSqlParserUtil.parse(filterSql);
-        Select selectAggr = (Select) CCJSqlParserUtil.parse(filterSql);
-        Select selectClient = (Select) CCJSqlParserUtil.parse(filterSql);
-
-        PlainSelect plainSelectInsight = selectInsight.getPlainSelect();
-        PlainSelect plainSelectPosition = selectPosition.getPlainSelect();
-        PlainSelect plainSelectAggr = selectAggr.getPlainSelect();
-        PlainSelect plainSelectClient = selectClient.getPlainSelect();
-
-        Expression whereClause = plainSelectInsight.getWhere();
-        if (whereClause == null) {
-            System.out.println("No WHERE clause found to process.");
-            return;
-        }
-
-        // 1. Process insighttypesql (modifies conditions in place based on parent logic)
-        Expression insightExpression = processInsightType(whereClause, false);
-        plainSelectInsight.setWhere(insightExpression);
-
-        // 2. Process other SQL variants by isolating specific prefixes
-        plainSelectPosition.setWhere(isolateTargetFilters(whereClause, "p."));
-        plainSelectAggr.setWhere(isolateTargetFilters(whereClause, "pa."));
-        plainSelectClient.setWhere(isolateTargetFilters(whereClause, "no_prefix"));
-
-        // Output results
-        System.out.println("--- 1. insighttypesql ---");
-        System.out.println(selectInsight);
-
-        System.out.println("\n--- 2. positionfiltersql ---");
-        System.out.println(selectPosition);
-
-        System.out.println("\n--- 3. aggrpositionfiltersql ---");
-        System.out.println(selectAggr);
-
-        System.out.println("\n--- 4. clientdemosql ---");
-        System.out.println(selectClient);
     }
 
     /**
-     * Recursively traverses the expression tree to satisfy the insighttype logic.
-     * Keeps 'insighttype', replaces others with 1=1 (under AND) or 1=0 (under OR).
+     * Configure these identifiers to match the actual database schema.
+     * Column names are compared case-insensitively.
      */
-    private static Expression processInsightType(Expression expression, boolean isUnderOr) {
-        if (expression instanceof BinaryExpression binaryExpr) {
-            boolean currentOrContext = isUnderOr || (expression instanceof OrExpression);
-            binaryExpr.setLeftExpression(processInsightType(binaryExpr.getLeftExpression(), currentOrContext));
-            binaryExpr.setRightExpression(processInsightType(binaryExpr.getRightExpression(), currentOrContext));
-            return binaryExpr;
-        } else if (expression instanceof Parenthesis parenthesis) {
-            parenthesis.setExpression(processInsightType(parenthesis.getExpression(), isUnderOr));
+    private static final Set<String> INSIGHT_COLUMNS =
+            Set.of("insighttype", "insight_type");
+
+    private static final Set<String> POSITION_COLUMNS =
+            Set.of("position", "position_id", "positionid");
+
+    private static final Set<String> AGGREGATE_POSITION_COLUMNS =
+            Set.of("aggregate_position", "aggregateposition",
+                   "aggregate_position_id");
+
+    private static final Set<String> DEMOGRAPHIC_COLUMNS =
+            Set.of("age", "gender", "ethnicity", "demographic",
+                   "demographic_id", "age_group");
+
+    private static final Set<String> POSITION_TABLES =
+            Set.of("position", "positions");
+
+    private static final Set<String> AGGREGATE_POSITION_TABLES =
+            Set.of("aggregate_position", "aggregate_positions");
+
+    private static final Set<String> DEMOGRAPHIC_TABLES =
+            Set.of("demographic", "demographics");
+
+    public static SplitSql split(String filterSql) throws Exception {
+        if (filterSql == null || filterSql.isBlank()) {
+            throw new IllegalArgumentException(
+                    "filterSql must not be null or empty");
+        }
+
+        Statement statement = CCJSqlParserUtil.parse(filterSql);
+
+        if (!(statement instanceof Select)) {
+            throw new IllegalArgumentException(
+                    "filterSql must be a SELECT query");
+        }
+
+        Select select = (Select) statement;
+
+        // Parse independently so that each generated SQL has its own AST.
+        String insightSql = filterInsightType(filterSql);
+        String positionSql = filterDomain(filterSql,
+                POSITION_COLUMNS, POSITION_TABLES);
+        String aggregatePositionSql = filterDomain(filterSql,
+                AGGREGATE_POSITION_COLUMNS, AGGREGATE_POSITION_TABLES);
+        String demographicSql = filterDomain(filterSql,
+                DEMOGRAPHIC_COLUMNS, DEMOGRAPHIC_TABLES);
+
+        return new SplitSql(
+                insightSql,
+                positionSql,
+                aggregatePositionSql,
+                demographicSql);
+    }
+
+    /**
+     * Retains insighttype predicates and replaces unrelated predicates.
+     *
+     * AND: unrelated predicate becomes TRUE.
+     * OR:  unrelated predicate becomes FALSE.
+     */
+    private static String filterInsightType(String sql) throws Exception {
+        Select select = (Select) CCJSqlParserUtil.parse(sql);
+
+        SelectBody body = select.getSelectBody();
+        if (!(body instanceof PlainSelect)) {
+            throw new UnsupportedOperationException(
+                    "Insight filtering currently supports PlainSelect only");
+        }
+
+        PlainSelect plainSelect = (PlainSelect) body;
+
+        if (plainSelect.getWhere() != null) {
+            plainSelect.setWhere(
+                    rewriteBooleanExpression(
+                            plainSelect.getWhere(), INSIGHT_COLUMNS));
+        }
+
+        if (plainSelect.getHaving() != null) {
+            plainSelect.setHaving(
+                    rewriteBooleanExpression(
+                            plainSelect.getHaving(), INSIGHT_COLUMNS));
+        }
+
+        return select.toString();
+    }
+
+    private static Expression rewriteBooleanExpression(
+            Expression expression,
+            Set<String> relevantColumns) throws Exception {
+
+        if (expression instanceof Parenthesis) {
+            Parenthesis parenthesis = (Parenthesis) expression;
+            parenthesis.setExpression(
+                    rewriteBooleanExpression(
+                            parenthesis.getExpression(), relevantColumns));
             return parenthesis;
-        } else {
-            // It's a leaf node expression (e.g., Column = Value)
-            if (expression.toString().contains("insighttype")) {
-                return expression; // Retain
-            } else {
-                // Replace based on parent context clause rules
-                return isUnderOr ? new LongValue(0) : new LongValue(1); // JSqlParser simplifies '1' or '0' natively as expressions
+        }
+
+        if (expression instanceof AndExpression) {
+            AndExpression and = (AndExpression) expression;
+            and.setLeftExpression(
+                    rewriteBooleanExpression(
+                            and.getLeftExpression(), relevantColumns));
+            and.setRightExpression(
+                    rewriteBooleanExpression(
+                            and.getRightExpression(), relevantColumns));
+            return and;
+        }
+
+        if (expression instanceof OrExpression) {
+            OrExpression or = (OrExpression) expression;
+            or.setLeftExpression(
+                    rewriteBooleanExpression(
+                            or.getLeftExpression(), relevantColumns));
+            or.setRightExpression(
+                    rewriteBooleanExpression(
+                            or.getRightExpression(), relevantColumns));
+            return or;
+        }
+
+        if (containsRelevantColumn(expression, relevantColumns)) {
+            return expression;
+        }
+
+        // A leaf predicate is unrelated to insighttype.
+        // Its replacement depends on its immediate Boolean parent.
+        return expression;
+    }
+
+    /**
+     * Returns true when an expression references any configured column.
+     */
+    private static boolean containsRelevantColumn(
+            Expression expression,
+            Set<String> relevantColumns) {
+
+        String text = expression.toString().toLowerCase(Locale.ROOT);
+
+        for (String column : relevantColumns) {
+            String normalized = column.toLowerCase(Locale.ROOT);
+            if (text.matches("(?s).*\\b" +
+                    java.util.regex.Pattern.quote(normalized) +
+                    "\\b.*")) {
+                return true;
             }
         }
+
+        return false;
     }
 
     /**
-     * Recursively targets and retains only matching rules, discarding everything else.
+     * Extracts a domain query by retaining relevant predicates.
+     *
+     * This basic version retains the original FROM/JOIN structure.
+     * Join pruning and alias dependency resolution are schema-specific.
      */
-    private static Expression isolateTargetFilters(Expression expression, String targetRule) {
-        if (expression instanceof BinaryExpression binaryExpr) {
-            Expression left = isolateTargetFilters(binaryExpr.getLeftExpression(), targetRule);
-            Expression right = isolateTargetFilters(binaryExpr.getRightExpression(), targetRule);
+    private static String filterDomain(
+            String sql,
+            Set<String> relevantColumns,
+            Set<String> relevantTables) throws Exception {
 
-            if (left == null) return right;
-            if (right == null) return left;
+        Select select = (Select) CCJSqlParserUtil.parse(sql);
+        SelectBody body = select.getSelectBody();
 
-            binaryExpr.setLeftExpression(left);
-            binaryExpr.setRightExpression(right);
-            return binaryExpr;
-        } else if (expression instanceof Parenthesis parenthesis) {
-            Expression internal = isolateTargetFilters(parenthesis.getExpression(), targetRule);
-            if (internal == null) return null;
-            parenthesis.setExpression(internal);
-            return parenthesis;
+        if (!(body instanceof PlainSelect)) {
+            throw new UnsupportedOperationException(
+                    "Domain filtering currently supports PlainSelect only");
         }
 
-        // Leaf Node Matching
-        String exprStr = expression.toString();
-        boolean matches = switch (targetRule) {
-            case "p." -> exprStr.startsWith("p.");
-            case "pa." -> exprStr.startsWith("pa.");
-            case "no_prefix" -> !exprStr.contains(".") && !exprStr.contains("insighttype");
-            default -> false;
-        };
+        PlainSelect plainSelect = (PlainSelect) body;
 
-        return matches ? expression : null;
+        if (plainSelect.getWhere() != null) {
+            plainSelect.setWhere(
+                    keepRelevantPredicates(
+                            plainSelect.getWhere(), relevantColumns));
+        }
+
+        if (plainSelect.getHaving() != null) {
+            plainSelect.setHaving(
+                    keepRelevantPredicates(
+                            plainSelect.getHaving(), relevantColumns));
+        }
+
+        return select.toString();
+    }
+
+    /**
+     * Keeps predicates mentioning relevant columns.
+     * Unrelated leaves are replaced with TRUE to avoid excluding rows.
+     */
+    private static Expression keepRelevantPredicates(
+            Expression expression,
+            Set<String> relevantColumns) throws Exception {
+
+        if (expression instanceof Parenthesis) {
+            Parenthesis p = (Parenthesis) expression;
+            p.setExpression(keepRelevantPredicates(
+                    p.getExpression(), relevantColumns));
+            return p;
+        }
+
+        if (expression instanceof AndExpression) {
+            AndExpression and = (AndExpression) expression;
+            and.setLeftExpression(keepRelevantPredicates(
+                    and.getLeftExpression(), relevantColumns));
+            and.setRightExpression(keepRelevantPredicates(
+                    and.getRightExpression(), relevantColumns));
+            return and;
+        }
+
+        if (expression instanceof OrExpression) {
+            OrExpression or = (OrExpression) expression;
+            or.setLeftExpression(keepRelevantPredicates(
+                    or.getLeftExpression(), relevantColumns));
+            or.setRightExpression(keepRelevantPredicates(
+                    or.getRightExpression(), relevantColumns));
+            return or;
+        }
+
+        return containsRelevantColumn(expression, relevantColumns)
+                ? expression
+                : CCJSqlParserUtil.parseCondExpression(TRUE_CONDITION);
+    }
+
+    public static void main(String[] args) throws Exception {
+        String filterSql =
+                "SELECT * FROM employee e " +
+                "WHERE e.insighttype = 'SALES' " +
+                "AND e.position_id = 10 " +
+                "AND (e.gender = 'F' OR e.age > 30)";
+
+        SplitSql result = split(filterSql);
+
+        System.out.println("insightTypeFilterSql:\n"
+                + result.insightTypeFilterSql);
+        System.out.println("positionFilterSql:\n"
+                + result.positionFilterSql);
+        System.out.println("aggregatePositionFilterSql:\n"
+                + result.aggregatePositionFilterSql);
+        System.out.println("demographicFilterSql:\n"
+                + result.demographicFilterSql);
     }
 }
