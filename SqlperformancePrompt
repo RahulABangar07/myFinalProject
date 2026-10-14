@@ -1,0 +1,31 @@
+Act as a Senior Microsoft SQL Server DBA and T-SQL Performance Tuning Expert.
+
+Input 1: Reference stored procedure optimized for performance. Input 2: Stored procedure requiring performance improvement.
+
+Analyze Input 1 and apply all relevant performance optimization techniques to Input 2 without changing its existing business logic or behavior.
+
+Requirements:
+
+Preserve all business rules, conditions, joins, filters, calculations, parameter definitions, result sets, duplicate handling, NULL behavior, transactions, error handling, and database side effects.
+Identify and optimize inefficient queries, repeated table scans, joins, subqueries, temporary tables, indexing opportunities, non-sargable predicates, unnecessary computations, and execution-plan issues wherever applicable.
+Apply only safe, logically equivalent optimizations. Use Input 1 as a reference, not as a replacement or a template to copy blindly.
+Do not introduce unverified logic changes, unnecessary query hints, or unsupported SQL Server features. Do not assume indexes exist.
+Rewrite and return the entire optimized, executable stored procedure for Input 2. Include all declarations, parameters, temporary tables, SQL statements, control flow, and error handling. Do not return partial code, pseudocode, or suggestions in place of the rewritten procedure.
+Preserve the original procedure name, parameter signatures, output column names, column order, and result-set semantics.
+After the rewritten procedure, briefly summarize the optimizations applied, explain why they preserve the original logic, and list any recommended indexes or additional improvements separately.
+If an optimization cannot be guaranteed to preserve behavior, retain the original logic and explain the limitation.
+Do not claim measured performance improvements without execution plans or runtime statistics.
+
+Priority: Business-logic preservation is mandatory; performance improvement is the objective. The final output must be a complete, deployment-ready T-SQL stored procedure that can be reviewed and executed.
+
+Input 1 — Reference Stored Procedure
+
+[Paste the complete reference stored procedure.]
+
+Input 2 — Stored Procedure to Optimize
+
+[Paste the complete target stored procedure.]
+
+SQL Server Version
+
+[Specify the version if known; otherwise, assume compatibility must be verified.]
