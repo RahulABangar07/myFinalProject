@@ -466,6 +466,13 @@ public final class ConditionEvaluator {
             "invalid input"
         };
 
+
+        /*
+        IF ISNULL(LTRIM(RTRIM(@filterSql)), '') <> '1=1'
+BEGIN
+    SET @sql = @sql + ' AND your_condition';
+END;*/
+
         for (String input : inputs) {
             System.out.printf(
                 "%-48s -> %s%n",
