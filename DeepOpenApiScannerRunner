@@ -13,6 +13,8 @@
 </dependencies>
 
 
+
+
 package com.ai.agent;
 
 import dev.langchain4j.service.SystemMessage;
@@ -32,6 +34,7 @@ public interface DeepOpenApiAgent {
         """)
     String generateFullSpecification(@UserMessage String deepContextCode);
 }
+
 
 
 
