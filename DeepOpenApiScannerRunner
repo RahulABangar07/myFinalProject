@@ -1,0 +1,140 @@
+<dependencies>
+    <!-- LangChain4j Infrastructure Integration -->
+    <dependency>
+        <groupId>dev.langchain4j</groupId>
+        <artifactId>langchain4j</artifactId>
+        <version>0.35.0</version>
+    </dependency>
+    <dependency>
+        <groupId>dev.langchain4j</groupId>
+        <artifactId>langchain4j-open-ai</artifactId>
+        <version>0.35.0</version>
+    </dependency>
+</dependencies>
+
+
+package com.ai.agent;
+
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+
+public interface DeepOpenApiAgent {
+
+    @SystemMessage("""
+        You are an elite API Architect and Technical Writer. 
+        Your task is to analyze the provided codebase context (which includes Controller classes, DTOs, and Request/Response objects) and build a complete, highly precise OpenAPI 3.0.0 Specification in YAML format.
+        
+        Requirements:
+        1. Resolve all structural paths, HTTP verbs, methods, status codes, query strings, and path parameters.
+        2. Map complex request and response payloads to complete JSON objects under the 'components/schemas' section. Do not use generic 'object' placeholders without defining their fields.
+        3. Match property names, array compositions, enums, data types (string, integer, number, boolean), and validation attributes directly from the Java source declarations.
+        4. Output ONLY valid OpenAPI YAML code inside standard markdown code blocks. Do not add conversational pleasantries.
+        """)
+    String generateFullSpecification(@UserMessage String deepContextCode);
+}
+
+
+
+package com.ai.agent;
+
+import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.service.AiServices;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class DeepOpenApiScannerRunner {
+
+    public static void main(String[] args) {
+        String apiKey = System.getenv("OPENAI_API_KEY");
+        if (apiKey == null || apiKey.isEmpty()) {
+            System.err.println("Please configure your OPENAI_API_KEY environment variable before running.");
+            return;
+        }
+
+        // Configure targeted workspace parameters
+        String sourceRootPath = "./src/main/java"; 
+        String targetOutputFile = "./openapi.yaml";
+
+        System.out.println("Beginning structural deep scan at source directory: " + sourceRootPath);
+
+        try {
+            // 1. Gather all system files matching boundary heuristics
+            String comprehensiveContext = buildDeepCodebaseContext(Paths.get(sourceRootPath));
+
+            if (comprehensiveContext.trim().isEmpty()) {
+                System.out.println("Scan complete: No architectural controllers or source entities discovered.");
+                return;
+            }
+
+            // 2. Initialize the AI Deep Engine Agent
+            OpenAiChatModel model = OpenAiChatModel.builder()
+                    .apiKey(apiKey)
+                    .modelName("gpt-4o")
+                    .temperature(0.1) // Low temperature for high structural precision
+                    .build();
+
+            DeepOpenApiAgent agent = AiServices.create(DeepOpenApiAgent.class, model);
+
+            System.out.println("Processing code architecture context through Agent...");
+            String rawYamlOutput = agent.generateFullSpecification(comprehensiveContext);
+
+            // 3. Clean block formatting tags and output target file
+            String structuredYaml = extractYamlBlock(rawYamlOutput);
+            Files.writeString(Paths.get(targetOutputFile), structuredYaml);
+
+            System.out.println("SUCCESS: Deep OpenAPI spec with full schemas written to: " + targetOutputFile);
+
+        } catch (IOException e) {
+            System.err.println("Filesystem scanning encounter execution error: " + e.getMessage());
+        }
+    }
+
+    private static String buildDeepCodebaseContext(Path srcRoot) throws IOException {
+        if (!Files.exists(srcRoot)) {
+            return "";
+        }
+
+        StringBuilder aggregateBuffer = new StringBuilder();
+        
+        try (Stream<Path> fileWalk = Files.walk(srcRoot)) {
+            List<Path> javaSourceFiles = fileWalk
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .collect(Collectors.toList());
+
+            for (Path path : javaSourceFiles) {
+                String contents = Files.readString(path);
+                
+                // Scan criteria targets Routing Handlers (Controllers) along with data structure types (DTOs, Records, Entities)
+                boolean isController = contents.contains("@RestController") || contents.contains("@Controller") || path.getFileName().toString().contains("Controller");
+                boolean isDtoOrModel = contents.contains("record ") || contents.contains("class ") && (path.toString().contains("dto") || path.toString().contains("model") || path.toString().contains("request") || path.toString().contains("response") || path.toString().contains("entity"));
+
+                if (isController || isDtoOrModel) {
+                    System.out.println("-> Structural Component Discovered: " + path.getFileName());
+                    aggregateBuffer.append("/// FILE PATH: ").append(path.toString()).append("\n");
+                    aggregateBuffer.append(contents).append("\n\n");
+                }
+            }
+        }
+        return aggregateBuffer.toString();
+    }
+
+    private static String extractYamlBlock(String rawContent) {
+        if (rawContent.contains("```yaml")) {
+            int start = rawContent.indexOf("```yaml") + 7;
+            int end = rawContent.indexOf("```", start);
+            return rawContent.substring(start, end).trim();
+        } else if (rawContent.contains("```")) {
+            int start = rawContent.indexOf("```") + 3;
+            int end = rawContent.indexOf("```", start);
+            return rawContent.substring(start, end).trim();
+        }
+        return rawContent.trim();
+    }
+}
