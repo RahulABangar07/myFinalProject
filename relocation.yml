@@ -1,0 +1,13 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: relocation-mcp-server
+  ai:
+    mcp:
+      server:
+        name: relocation-policy-mcp
+        version: 1.0.0
+        type: SYNC
+        sse-message-endpoint: /mcp/message
