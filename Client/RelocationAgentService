@@ -1,0 +1,44 @@
+package com.enterprise.agent.service;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
+import org.springframework.stereotype.Service;
+
+@Service
+public class RelocationAgentService {
+
+    private final ChatClient chatClient;
+
+    private static final String SYSTEM_PROMPT = """
+            You are an Enterprise Workplace Mobility & Relocation AI Agent.
+            Your goal is to optimize employee commute expenses by matching staff with near-office housing policies.
+            
+            Follow this exact execution sequence:
+            1. Call 'find_employees_by_area' for the residential area requested by the user.
+            2. If no employees are found in that area, clearly state that no matching records exist and stop.
+            3. For EVERY employee returned, invoke 'recommend_relocation_policy' using their employeeId and monthlyCommuteCost.
+            4. Present a clear executive summary containing:
+               - A markdown table comparing each employee's current commute cost, recommended near-office policy, housing stipend, and net company savings.
+               - Total monthly commute cost eliminated vs. total housing stipend required across the group.
+            """;
+
+    public RelocationAgentService(ChatClient.Builder chatClientBuilder,
+                                  SyncMcpToolCallbackProvider mcpToolCallbackProvider) {
+        this.chatClient = chatClientBuilder
+                .defaultSystem(SYSTEM_PROMPT)
+                .defaultTools(mcpToolCallbackProvider)
+                .build();
+    }
+
+    public String analyzeAreaRelocation(String area) {
+        String userPrompt = String.format(
+                "Find all employees commuting from '%s' and recommend the best relocation policy near the office for each of them by compensating their commute costs.",
+                area
+        );
+
+        return chatClient.prompt()
+                .user(userPrompt)
+                .call()
+                .content();
+    }
+}
