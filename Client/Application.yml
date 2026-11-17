@@ -1,0 +1,25 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: relocation-agent-service
+  ai:
+    azure:
+      openai:
+        endpoint: https://azure.com
+        api-key: YOUR-AZURE-OPENAI-API-KEY
+        chat:
+          options:
+            deployment-name: gpt-4o
+            temperature: 0.1
+    mcp:
+      client:
+        enabled: true
+        name: relocation-orchestrator-agent
+        version: 1.0.0
+        type: SYNC
+        sse:
+          connections:
+            relocation-server:
+              url: http://localhost:8080
